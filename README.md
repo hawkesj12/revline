@@ -2,32 +2,9 @@
 
 A rich, single-file status line for [Claude Code](https://claude.com/claude-code) — your model, cost, git state, and a live **token-throughput tachometer**, rendered right in the terminal footer. Zero dependencies, one Python file, drops in with three lines of config.
 
-<!-- Replace with a real screenshot of your footer: -->
-<!-- ![revline](docs/screenshot.png) -->
+![revline in horizontal layout](docs/horizontal.png)
 
-```
-Claude Code:
-  model: Sonnet 4.5 🧠
-  effort: low medium [high] xhigh max
-  session name: #demo
-  cost: $0.42   time: 15m
-  context: ████░░░░░░ 38% : 76k / 200k
-  api: 33% of wall
-Git:
-  repo: revline   branch: main ✓synced
-  clean   last commit: 7m ago
-Gauges:
-  tps: ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░ 1.2k/s
-   1m: ▁▂▃▅▇█▆▄▂▁▁▁ 607 TPM
-  10m: ▂▃▄▅▆▇█▇▅▄▃▂ 29k TP10M
-   1h: ▁▁▂▃▄▅▆▇█▇▆▅ 76k TPH
-   1d: ▂▄▆█▇▅▃▂▁▁▁▁ 210k TPD
-Usage:
-  5h: ██░░░░░░░░ 22%
-  7d: ████░░░░░░ 41%
-```
-
-_(The `tps` bar fills left→right and shifts green → amber → red as throughput climbs — a tachometer for how hard the model is working. In a real terminal it's in color.)_
+_The `tps` bar fills left→right and shifts green → amber → red as throughput climbs — a tachometer for how hard the model is working._
 
 ## Why
 
@@ -84,23 +61,13 @@ ln -s ~/.claude/revline.py ~/.local/bin/revline   # any dir on your PATH
 
 ## Layout
 
-`revline` renders in one of two orientations:
+`revline` renders in one of two orientations.
 
-- **vertical** _(default)_ — all four sections stacked.
-- **horizontal** — Claude Code + Git on the left, Gauges + Usage on the right, in two aligned columns. Good for a wide, short footer.
+**vertical** _(default)_ — all four sections stacked:
 
-```
-Claude Code:                              Gauges:
-  model: Sonnet 4.5 🧠                        tps: ██████████░░░░░░░░░░░░░░░░ 1.2k/s
-  effort: low medium [high] xhigh max          1m: ▁▂▃▅▇█▆▄▂▁▁▁ 607 TPM
-  session name: #demo                         10m: ▂▃▄▅▆▇█▇▅▄▃▂ 29k TP10M
-  cost: $0.42   time: 15m                      1h: ▁▁▂▃▄▅▆▇█▇▆▅ 76k TPH
-  context: ████░░░░░░ 38% : 76k / 200k         1d: ▂▄▆█▇▅▃▂▁▁▁▁ 210k TPD
-  api: 33% of wall                          Usage:
-Git:                                          5h: ██░░░░░░░░ 22%
-  repo: revline   branch: main ✓synced        7d: ████░░░░░░ 41%
-  clean   last commit: 7m ago
-```
+![vertical layout](docs/vertical.png)
+
+**horizontal** — Claude Code + Git on the left, Gauges + Usage on the right, in two aligned columns. Good for a wide, short footer (shown at the top of this README).
 
 Switch layouts from the terminal (takes effect on the next render, ~1s — no restart):
 
