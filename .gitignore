@@ -1,0 +1,4 @@
+.repometa/
+__pycache__/
+*.pyc
+revline.config.json
