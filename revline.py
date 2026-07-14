@@ -389,7 +389,7 @@ def git_state(cwd, sid):
 # Orientation: "vertical" (default) stacks all four sections; "horizontal" puts
 # Claude Code + Git on the left and Gauges + Usage on the right as two aligned
 # columns — handy for a wide, short footer. Chosen (in precedence order) by:
-#   1. revline.config.json next to this script, e.g. {"layout": "horizontal"}
+#   1. revline.config.json next to this script, e.g. {"layout": "H"}  (H | V)
 #   2. the CC_STATUSLINE_LAYOUT env var (fallback for those who prefer env)
 #   3. default "vertical"
 # Set it with the CLI: `revline flip` (toggle), `revline horizontal`, `revline
@@ -421,24 +421,34 @@ def _config():
         return {}
 
 
-def _layout():
-    v = (
-        str(_config().get("layout") or os.environ.get("CC_STATUSLINE_LAYOUT", ""))
-        .strip()
-        .lower()
+def _norm(value):
+    """Any of H / h / horizontal / wide → 'horizontal'; everything else → 'vertical'.
+    Accepts both the short codes stored in the config and the long words."""
+    return (
+        "horizontal"
+        if str(value).strip().lower() in ("h", "horizontal", "wide")
+        else "vertical"
     )
-    return "horizontal" if v in ("horizontal", "h", "wide") else "vertical"
+
+
+def _code(orientation):
+    """The short code stored in the config file: 'horizontal' → 'H', else 'V'."""
+    return "H" if orientation == "horizontal" else "V"
+
+
+def _layout():
+    return _norm(_config().get("layout") or os.environ.get("CC_STATUSLINE_LAYOUT", ""))
 
 
 def _set_layout(value, announce=None):
-    """Persist the orientation into revline.config.json (merging, not clobbering
-    any other keys). Returns a message to print. The next render reads it live."""
-    value = "horizontal" if value in ("horizontal", "h", "wide") else "vertical"
+    """Persist the orientation into revline.config.json as a short H/V code
+    (merging, not clobbering other keys). The next render reads it live."""
+    orientation = _norm(value)
     cfg = _config()
-    cfg["layout"] = value
+    cfg["layout"] = _code(orientation)  # store "H" / "V", not the long word
     try:
         _atomic_write(_config_path(), json.dumps(cfg, indent=2) + "\n")
-        return announce or f"revline: layout → {value}"
+        return announce or f"revline: layout → {_code(orientation)} ({orientation})"
     except Exception as e:
         return f"revline: could not write {_config_path()} ({e})"
 
@@ -447,7 +457,7 @@ def _flip():
     """Toggle orientation and persist it."""
     cur = _layout()
     new = "vertical" if cur == "horizontal" else "horizontal"
-    return _set_layout(new, announce=f"revline: {cur} → {new}")
+    return _set_layout(new, announce=f"revline: {_code(cur)} → {_code(new)} ({new})")
 
 
 def _vis_width(s):
@@ -732,11 +742,12 @@ _USAGE = """revline — a rich status line for Claude Code
 Rendering (Claude Code runs this for you; it reads the session JSON on stdin):
   revline                 render the status line
 
-Layout control (writes revline.config.json; the next render picks it up ~1s):
-  revline flip            toggle vertical <-> horizontal
-  revline horizontal      two columns (Claude Code + Git | Gauges + Usage)
-  revline vertical        stacked (the default)
+Layout control (writes revline.config.json as H/V; next render picks it up ~1s):
+  revline flip            toggle H <-> V
+  revline H               horizontal — two columns (Claude Code + Git | Gauges + Usage)
+  revline V               vertical — stacked (the default)
   revline help            show this
+  (horizontal / vertical also accepted)
 
 Orientation is also read from the CC_STATUSLINE_LAYOUT env var as a fallback."""
 
