@@ -1,20 +1,21 @@
 # revline
 
-A rich, single-file status line for [Claude Code](https://claude.com/claude-code) — your model, cost, git state, and a live **token-throughput tachometer**, rendered right in the terminal footer. Zero dependencies, one Python file, drops in with three lines of config.
+A rich, single-file status line for [Claude Code](https://claude.com/claude-code) — your model, cost, git state, and a live **read/write "mirror"** that charts the tokens the model reads vs writes over time, rendered right in the terminal footer. Zero dependencies, one Python file, drops in with three lines of config.
 
 ![revline in horizontal layout](docs/horizontal.png)
 
-_The `tps` bar fills left→right and shifts green → amber → red as throughput climbs — a tachometer for how hard the model is working._
+_The **mirror** splits each row down the middle: tokens **read** (input, warm) fill the left half from the center, tokens **written** (output, cool) fill the right — newest at the center, five timescales stacked (`1s` → `1d`)._
 
 ## Why
 
-Claude Code's built-in footer is a single line. When you're deep in a long session you often want more at a glance: how full is the context window, what has this session cost, what's my git state, and — the fun part — how much token throughput is moving right now. `revline` puts all of that in a compact, color-coded dashboard, and it's a single self-contained script you can read top to bottom and trust.
+Claude Code's built-in footer is a single line. When you're deep in a long session you often want more at a glance: how full is the context window, what has this session cost, what's my git state, and — the fun part — how much the model is reading and writing right now. `revline` puts all of that in a compact, color-coded dashboard, and it's a single self-contained script you can read top to bottom and trust.
 
 ## Features
 
-- **Four sections, color-grouped by system** — Claude Code (model · effort · session · cost · context · cache/burn), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (throughput), Usage (rate-limit budgets).
-- **A throughput tachometer** — an LED bar that fills with tokens/sec (log-scaled) and is colored by position: green at idle, up through amber, into red at full tilt.
-- **Multi-timescale sparklines** — 1m / 10m / 1h / 1d token-throughput mini-charts with totals.
+- **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets).
+- **The read/write "mirror"** — a butterfly chart of tokens **read** (input, incl. cache) vs **written** (output) over time. Reading is warm and fills the left half from the center outward; writing is cool and fills the right. Newest is at the center, oldest at the outer edges, with the reading and writing totals flanking each row.
+- **Five timescales** — `1s` is a live, EMA-smoothed tachometer of the current rate; `1m / 10m / 4h / 1d` are history. Both bar height and hue rise with throughput.
+- **A fixed color scale** — a given throughput always looks the same over time; the colors don't drift as the peak changes.
 - **Two layouts, toggled live** — `vertical` (stacked) or `horizontal` (two aligned columns), switched with `revline flip` without restarting.
 - **Clickable git links** — repo and PR are OSC-8 hyperlinks in terminals that support them.
 - **Never crashes your footer** — any malformed input prints nothing and exits cleanly, rather than leaking a traceback.
@@ -23,7 +24,7 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 ## Requirements
 
 - **Python 3** (standard library only — no third-party packages).
-- A terminal with 256-color / truecolor support (most modern terminals: iTerm2, WezTerm, VS Code, the JetBrains terminal, Windows Terminal). OSC-8 links and the emoji glyph are optional niceties that degrade gracefully where unsupported.
+- A terminal with 256-color / truecolor support (most modern terminals: iTerm2, WezTerm, VS Code, the JetBrains terminal, Windows Terminal). OSC-8 links are an optional nicety that degrades gracefully where unsupported.
 
 ## Install
 
@@ -86,9 +87,9 @@ Orientation is resolved in this order:
 2. **`CC_STATUSLINE_LAYOUT`** environment variable (`H` / `V` / `horizontal` / `vertical`) — a fallback if you'd rather set it declaratively.
 3. **Default:** vertical.
 
-## What the gauges measure (read this before trusting the numbers)
+## What the mirror measures (read this before trusting the numbers)
 
-The `tps` tachometer and the `1m/10m/1h/1d` charts track how fast the **context window grows** over time — a **throughput** gauge, not a billing figure. Most of those tokens are prompt-cache reads (billed at a fraction of fresh input), so a big "TPH" means _a lot of context moved through the model this hour_, which correlates with activity but is **not** your dollar cost. For spend, watch the `cost: $…` line (Claude Code's own estimate) and the `cache:` hit-ratio. Tokens ≈ activity, `$` ≈ cost.
+Each response, Claude Code reports how many tokens it **read** (input — mostly prompt-cache reads) and **wrote** (output). revline accumulates those per-response counts (they're per-response snapshots in the JSON, not cumulative) and charts reading vs writing over five timescales. **Reading dwarfs writing (~100×)** because every turn re-reads the whole context. This is a **throughput / activity** view, not a billing figure — most reading is cache (billed at a fraction of fresh input). For spend, watch the `cost: $…` line (Claude Code's own estimate) and the `cache:` hit-ratio. Tokens ≈ activity, `$` ≈ cost.
 
 ## Platform notes
 

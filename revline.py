@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════
-# statusline.py — a rich, multi-section Claude Code status line
+# revline.py — a rich, multi-section Claude Code status line
 # ═══════════════════════════════════════════════════════════════
-# A vertical, color-coded dashboard rendered in the Claude Code footer. Four
-# sections, color-grouped by which system each line belongs to:
-#   Claude Code:  model · effort · 🧠thinking · style · session · cost · context · cache/burn/api
+# A color-coded dashboard rendered in the Claude Code footer. Four sections,
+# color-grouped by which system each line belongs to:
+#   Claude Code:  model · thinking · effort · session · cost · context · cache/burn/api
 #   Git:          repo (clickable) · branch · ↑↓ upstream · PR · staged/mod/new · last-commit age
-#   Gauges:       a tps throttle-tachometer (gradient LED fill) + token-consumption sparklines at 1m/10m/1h/1d
+#   Gauges:       the read/write "mirror" — a butterfly of tokens READ (input) vs
+#                 WRITTEN (output) over time, at 1s / 1m / 10m / 4h / 1d
 #   Usage:        5h / 7d rate-limit budgets as bars (the Max-plan runway)
+#
+# The mirror, per row:  <span>  <read#> ▏<chart>▕ <write#>
+#   • Reading (input, incl. cache) is WARM and fills the left half from the center
+#     outward; writing (output) is COOL and fills the right half. A dim │ marks
+#     "now" at the center; the ▏ ▕ rails frame the chart. Newest is at the center,
+#     oldest at the outer edges. 12 cells per side.
+#   • '1s' is a LIVE tachometer (an EMA-smoothed current rate); the rows below are
+#     HISTORY (each cell one time-bucket). Both height and hue rise with throughput.
 #
 # Design notes:
 #   • Color encodes MEANING: brand colors group by system (Claude coral, GitHub
-#     green); the gauge/usage percentages use a green→yellow→red HEALTH scale.
-#   • Bars use the █/░ convention; charts are Unicode sparklines (▁▂▃▄▅▆▇█).
+#     green); usage % uses a green→yellow→red HEALTH scale; the mirror uses WARM
+#     for reading, COOL for writing, brighter/taller = higher throughput.
+#   • The mirror's scale is FIXED (a constant reference rate), so a given
+#     throughput always looks the same over time — colors don't drift with the peak.
 #   • Repo + PR are OSC 8 hyperlinks — Cmd-click to open on GitHub.
-#   • Git is cached per session (3s TTL) so a big dirty repo never lags renders.
+#   • Git is cached per session (12s TTL) so a big dirty repo never lags renders.
 #
-# ── What the token gauges MEASURE (read this before trusting the numbers) ──
-#   The tps speedometer and the 1m/10m/1h/1d charts + TPM/TP10M/TPH/TPD totals
-#   track how fast the CONTEXT WINDOW grows over time (the delta of
-#   `total_input_tokens`). That is a THROUGHPUT gauge, NOT a billing figure:
-#   most of those tokens are prompt-CACHE READS (billed at ~0.1×), not the
-#   expensive fresh input / output tokens. So a big "TPH" means "a lot of context
-#   moved through the model this hour," which correlates with activity but is
-#   NOT your dollar cost. For actual spend, watch `cost: $…` (Claude Code's own
-#   client-side estimate) and the `cache:` hit-ratio. Tokens ≈ activity, $ ≈ cost.
+# ── What the mirror MEASURES (read this before trusting the numbers) ──
+#   Each response, Claude Code reports how many tokens it READ (input — mostly
+#   prompt-CACHE reads) and WROTE (output). Those fields are per-response snapshots
+#   (NOT cumulative in the JSON since v2.1.132), so revline accumulates them into a
+#   small local store and charts reading vs writing over five timescales. Reading
+#   dwarfs writing (~100×) because every turn re-reads the whole context. This is a
+#   THROUGHPUT / activity view, NOT a dollar figure: most reading is cache (billed
+#   ~0.1×). For actual spend, watch `cost: $…` (Claude Code's own estimate) and the
+#   `cache:` hit-ratio. Tokens ≈ activity, $ ≈ cost.
 #
 # Runs locally, reads Claude Code's status JSON on stdin, prints text.
 # It costs ZERO API tokens — the status line is never sent to the model.
@@ -162,14 +173,15 @@ def _atomic_write(path, text):
 
 def _read_store(path):
     """Parse a token store, skipping any single malformed (e.g. torn) line
-    rather than dropping the entire history on one bad row."""
+    rather than dropping the entire history on one bad row. Rows are int tuples
+    of whatever arity was written — the token store is
+    (t, in_cum, out_cum, in_raw, out_raw)."""
     rows = []
     try:
         if os.path.exists(path):
             for ln in open(path).read().splitlines():
                 try:
-                    t, c, tot = ln.split(",")
-                    rows.append((int(t), int(c), int(tot)))
+                    rows.append(tuple(int(x) for x in ln.split(",")))
                 except Exception:
                     continue
     except Exception:
@@ -178,7 +190,7 @@ def _read_store(path):
 
 
 def _write_store(path, rows):
-    _atomic_write(path, "\n".join(f"{t},{c},{tot}" for t, c, tot in rows))
+    _atomic_write(path, "\n".join(",".join(str(x) for x in r) for r in rows))
 
 
 def _gc():
@@ -200,58 +212,86 @@ def _gc():
         pass
 
 
-def record_tokens(sid, cur_total):
-    """Update the token stores and return (fine_rows, day_rows, now). Cumulative
-    counts only growth (compaction drops ignored). Two stores: a fine one (1 h,
-    written every call) drives tps/1m/10m/1h; a throttled coarse one (25 h, ≥120 s
-    between writes) drives the 1-day gauge without unbounded row growth at 1 s refresh."""
+def record_tokens(sid, in_raw, out_raw):
+    """Update the token stores and return (fine_rows, day_rows, now). in_raw/out_raw
+    are the MOST-RECENT RESPONSE's input and output tokens (Claude Code's
+    total_input_tokens / total_output_tokens are per-response snapshots since
+    v2.1.132, NOT cumulative). Since each response READ in_raw tokens (input incl.
+    cache reads) and WROTE out_raw, we ACCUMULATE them into running sums here — the
+    only place a cumulative token history exists — so every gauge draws from one
+    store. Rows are (t, in_cum, out_cum, in_raw, out_raw). Two stores: a fine one
+    (1 h, written on every change) drives the seconds/1m/10m rows; a throttled coarse
+    one (25 h, ≥120 s between writes) drives the 4h/1d rows without unbounded row
+    growth at 1 s refresh."""
     now = int(time.time())
-    fpath = os.path.join(TMP, f"cc-statusline-tok-{sid}")
-    dpath = os.path.join(TMP, f"cc-statusline-day-{sid}")
-    fine = _read_store(fpath)
-    prev_cum = fine[-1][1] if fine else 0
-    prev_total = fine[-1][2] if fine else None
-    # Token counts only move when a message completes, so at 1s refresh ~99% of
-    # renders are unchanged — only append + rewrite when cur_total actually moved.
-    # This kills the per-second file churn AND keeps the store to change-points
-    # only (~100 rows/hr, not 3600), so reads and bucketing stay cheap.
+    fpath = os.path.join(TMP, f"cc-statusline-io-{sid}")
+    dpath = os.path.join(TMP, f"cc-statusline-ioday-{sid}")
+    fine = [r for r in _read_store(fpath) if len(r) >= 5]  # ignore torn short rows
+    if fine:
+        in_cum, out_cum, prev_in, prev_out = fine[-1][1:5]
+    else:
+        in_cum = out_cum = 0
+        prev_in = prev_out = None
+    # The snapshot only moves when a new response lands, so at 1s refresh ~99% of
+    # renders are unchanged — only append + rewrite when a raw total actually moved,
+    # which also means we add each response's tokens exactly ONCE. This keeps the
+    # store to change-points only (~100 rows/hr, not 3600), so reads/bucketing stay
+    # cheap. Summing (not delta-ing) the snapshots is robust to /compact resets: a
+    # smaller post-compact in_raw just adds a smaller amount, never a negative.
     # NOTE: this read-modify-write is not locked. The render fires on both the 1s
     # timer and after a message, so two instances can overlap; _atomic_write keeps
     # the file itself intact (never a torn read), but the later os.replace can drop
     # the other's appended row. Effect is a rare (~1%) undercount of a throughput
     # gauge — never corruption. A lock would be POSIX-only (fcntl) and break the
     # Windows portability above, so we accept the cosmetic gap rather than add one.
-    changed = prev_total is None or cur_total != prev_total
+    changed = prev_in is None or in_raw != prev_in or out_raw != prev_out
     if changed:
-        cum = prev_cum + max(
-            0, cur_total - (prev_total if prev_total is not None else cur_total)
-        )
-        fine.append((now, cum, cur_total))
+        in_cum += in_raw  # each new response read in_raw (incl. cache) …
+        out_cum += out_raw  # … and wrote out_raw; sum, don't delta (snapshots)
+        fine.append((now, in_cum, out_cum, in_raw, out_raw))
         fine = [r for r in fine if r[0] >= now - 3660]
         _write_store(fpath, fine)
-    day = _read_store(dpath)
+    day = [r for r in _read_store(dpath) if len(r) >= 5]
     if changed and (not day or now - day[-1][0] >= 120):
-        day.append((now, fine[-1][1], cur_total))
+        day.append((now, in_cum, out_cum, in_raw, out_raw))
         day = [r for r in day if r[0] >= now - 90000]
         _write_store(dpath, day)
     return fine, day, now
 
 
-def _cum_at(rows, ts):
-    """Cumulative tokens at a point in time (carry-forward last known)."""
+# A store row is (t, in_cum, out_cum, in_raw, out_raw); these pick which
+# cumulative a gauge charts — input (reading), output (writing), or their total.
+def IN(r):
+    return r[1]
+
+
+def OUT(r):
+    return r[2]
+
+
+def TOT(r):
+    return r[1] + r[2]
+
+
+def _cum_at(rows, ts, val=TOT):
+    """Cumulative value (per `val`) at a point in time (carry-forward last known)."""
     c = 0
-    for t, cc, _ in rows:
-        if t <= ts:
-            c = cc
+    for r in rows:
+        if r[0] <= ts:
+            c = val(r)
         else:
             break
     return c
 
 
-def bucket_series(rows, now, span_s, buckets=12):
-    """Log-normalized 0–100 per-bucket consumption over the last span_s seconds;
-    the busiest bucket is 100 (full █). [] when nothing was consumed. One forward
-    pass over the time-sorted rows — O(rows + buckets), not O(rows × buckets)."""
+def bucket_series(rows, now, span_s, buckets=12, val=TOT, nominal=None):
+    """0–100 per-bucket intensity of `val` over the last span_s seconds. With
+    `nominal` (tokens/sec), each bucket is scaled against a FIXED reference — a
+    bucket sustaining `nominal` tokens/sec reads ~100 — so a given throughput
+    always looks the same over time (stable color + height) instead of drifting
+    as the window's own peak changes. Without it, falls back to per-window peak
+    normalization. Any active bucket floors to a visible level. [] when nothing
+    was consumed. One forward pass — O(rows + buckets), not O(rows × buckets)."""
     if not rows:
         return []
     slot = span_s / buckets
@@ -259,50 +299,109 @@ def bucket_series(rows, now, span_s, buckets=12):
     cums, j, c = [], 0, 0
     for e in edges:  # carry-forward cumulative at each bucket edge, single walk
         while j < len(rows) and rows[j][0] <= e:
-            c = rows[j][1]
+            c = val(rows[j])
             j += 1
         cums.append(c)
     deltas = [max(0, cums[i + 1] - cums[i]) for i in range(buckets)]
-    mx = max(deltas) if deltas else 0
-    if mx <= 0:
+    ref = nominal * slot if nominal else (max(deltas) if deltas else 0)
+    if ref <= 0:
         return []
-    return [round(100 * math.log1p(d) / math.log1p(mx)) for d in deltas]
+    out = []
+    for d in deltas:  # 0 stays 0 (idle → blank); any activity floors to visible
+        out.append(
+            0
+            if d <= 0
+            else max(20, min(100, round(100 * math.log1p(d) / math.log1p(ref))))
+        )
+    return out
 
 
-def tps_windowed(rows, now, window=15):
-    """Tokens/sec over a trailing `window` seconds. Because it's a sliding
-    window, a burst decays back toward 0 as it ages out — so with a fast refresh
-    the speedometer needle glides instead of snapping (token data only changes
-    per message, so a raw instantaneous rate would just sit still then jump)."""
-    if not rows:
+def ema_rate(rows, now, val=OUT, halflife=8.0):
+    """Exponentially-smoothed rate of `val` in tokens/sec — the mph needle. Unlike
+    a trailing window (a hard edge, so the needle snaps when a burst ages out), an
+    EMA weights recent activity and lets older activity fade on a smooth exponential
+    curve, so the speedometer glides. `halflife` = seconds for old activity to lose
+    half its weight. Decays toward 0 while idle so a stalled session reads ~0."""
+    if len(rows) < 2:
         return 0.0
-    return max(0, _cum_at(rows, now) - _cum_at(rows, now - window)) / window
+    ema = 0.0
+    pt, pv = None, None
+    for r in rows:
+        t, v = r[0], val(r)
+        if pt is not None and t > pt:
+            dt = t - pt
+            rate = max(0, v - pv) / dt
+            a = 1 - 0.5 ** (dt / halflife)
+            ema += a * (rate - ema)
+        pt, pv = t, v
+    if pt is not None and now > pt:  # decay from the last change up to now
+        a = 1 - 0.5 ** ((now - pt) / halflife)
+        ema += a * (0.0 - ema)
+    return ema
 
 
-# position gradient (green low → yellow/amber mid → red flat-out), left→right
-_RAMP = [46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196]
+# cells per side of the mirror chart (reading | writing). 12 keeps the chart
+# compact and buckets each span into clean slices (1m→5s, 10m→50s, 4h→20m, 1d→2h).
+# The full chart is 2*HALF+1 wide (the +1 is the center divider).
+HALF = 12
+# the two mirror palettes: reading (input) warm, writing (output) cool. A cell's
+# color walks up its ramp with magnitude, so busier = brighter.
+_WARM = [52, 88, 124, 166, 202, 208, 214, 220]  # mirror reading (input) — warm
+_COOLH = [17, 18, 24, 31, 38, 44, 45, 51]  # mirror writing (output) — cool
+# fixed full-scale rates (tokens/sec): the "constant peak" that reads as full/bright.
+# Reading (input incl. cache) runs ~100× writing, so each side has its own — and
+# because the scale is FIXED, a given throughput always looks the same over time.
+_FULL_READ = 40000
+_FULL_WRITE = 400
+_SEP = "\033[38;5;240m│" + R  # dim center divider marking "now" between read | write
+_EDL = "\033[38;5;240m▏" + R  # left rail — where the chart starts (next to reading#)
+_EDR = "\033[38;5;240m▕" + R  # right rail — where the chart ends (next to writing#)
 
 
-def speedo(tps, width=36, maxtps=10000):
-    """An 80s-tachometer LED bar: fills left→right with tokens/sec (log-scaled so
-    both slow and fast read well), each lit LED colored by its POSITION — green at
-    the low end, up through yellow/amber, into red as throughput climbs toward
-    flat-out. The fill edge rises while we're pushing tokens and drains back as it
-    quiets, like a throttle. Unlit LEDs are ░. maxtps tops the scale — context
-    throughput runs to a few k/s, so 10k rarely pegs."""
-    dark = "\033[38;5;236m"
-    n = len(_RAMP)
-    frac = math.log1p(max(0.0, tps)) / math.log1p(maxtps)
-    frac = max(0.0, min(1.0, frac))
-    lit = round(frac * width)
-    cells = []
-    for i in range(width):
-        if i < lit:
-            c = _RAMP[min(n - 1, int(i / max(1, width - 1) * n))]
-            cells.append(f"\033[38;5;{c}m█")
-        else:
-            cells.append(f"{dark}░")
-    return "".join(cells) + R
+def _rampc(ramp, depth):
+    """Color at `depth` cells out from center (0 = center) along `ramp`, so a longer
+    fill walks further up the ramp toward its bright end. Used by the tach row."""
+    return f"\033[38;5;{ramp[round(depth / max(1, HALF - 1) * (len(ramp) - 1))]}m"
+
+
+def mirror_tach(read_rate, write_rate):
+    """The live 'secs' row: the tps tachometer split down the middle. Reading fills
+    LEDs leftward from center in the WARM palette (scaled to _FULL_READ), writing
+    rightward in the COOL palette (scaled to _FULL_WRITE) — brighter toward the edge,
+    a dim divider at 'now'. Fills grow with the current rate and drain as work quiets,
+    so the needle slides both ways on a FIXED scale (same rate → same fill)."""
+
+    def fill(rate, full):
+        return round(min(1.0, math.log1p(max(0.0, rate)) / math.log1p(full)) * HALF)
+
+    lf, wf = fill(read_rate, _FULL_READ), fill(write_rate, _FULL_WRITE)
+    left = [
+        (f"{_rampc(_WARM, HALF - 1 - p)}█{R}" if HALF - 1 - p < lf else " ")
+        for p in range(HALF)
+    ]
+    right = [(f"{_rampc(_COOLH, p)}█{R}" if p < wf else " ") for p in range(HALF)]
+    return "".join(left) + _SEP + "".join(right)
+
+
+def _mcell(ramp, v):
+    """One mirror-history cell: a colored block whose height AND hue rise with
+    magnitude; blank when the bucket is idle."""
+    if v <= 1:
+        return " "
+    c = ramp[round(min(100, v) / 100 * (len(ramp) - 1))]
+    return f"\033[38;5;{c}m{SPARK[round(min(100, v) / 100 * 7)]}{R}"
+
+
+def mirror_hist(rows, now, span):
+    """A history row of the butterfly: reading (warm) runs from the far-left
+    (oldest) inward to the center (newest); writing (cool) runs from the center
+    (newest) out to the far-right (oldest), a dim divider at 'now'. Both sides use
+    the FIXED full-scale rates so a given throughput reads the same over time."""
+    rd = bucket_series(rows, now, span, HALF, IN, _FULL_READ) or [0] * HALF
+    wr = bucket_series(rows, now, span, HALF, OUT, _FULL_WRITE) or [0] * HALF
+    left = [_mcell(_WARM, v) for v in rd]
+    right = [_mcell(_COOLH, v) for v in wr[::-1]]
+    return "".join(left) + _SEP + "".join(right)
 
 
 def git_state(cwd, sid):
@@ -463,8 +562,9 @@ def _flip():
 def _vis_width(s):
     """Displayed column width of a rendered line: strip SGR color codes and the
     invisible OSC-8 hyperlink wrappers (keeping the clickable TEXT between them),
-    then count East-Asian-wide / emoji glyphs (e.g. 🧠) as 2 cells and combining
-    marks as 0. This is what lets the horizontal layout align two columns."""
+    then count East-Asian-wide (CJK) glyphs as 2 cells and combining marks as 0.
+    This is what lets the horizontal layout align two columns. (revline avoids
+    emoji in aligned rows — terminals disagree on their width by a cell.)"""
     s = _OSC8.sub("", _ANSI_SGR.sub("", s))
     w = 0
     for ch in s:
@@ -505,7 +605,6 @@ def _render(d):
     model = obj(d.get("model")).get("display_name") or "?"
     effort = obj(d.get("effort")).get("level")
     thinking = obj(d.get("thinking")).get("enabled")
-    style = obj(d.get("output_style")).get("name")
     cwd = obj(d.get("workspace")).get("current_dir") or d.get("cwd") or ""
     sid = d.get("session_id") or "nosession"
     name = d.get("session_name")  # set via /rename or --name; absent when unnamed
@@ -552,32 +651,33 @@ def _render(d):
         "\u2800" * 2
     )  # Braille-blank indent (renders blank but survives Claude Code's per-line trim; ASCII/NBSP get trimmed)
 
-    def glabel(t):  # right-aligned gauge row label (tps / 1m / 10m / 1h)
-        return f"{LABEL}{t.rjust(3)}:{R} "
-
-    DASH = f"{DIM}{'─' * 12}{R}"  # placeholder when a chart has no data yet
+    def glabel(t):  # right-aligned gauge row label (mph / secs / 1m / 4h …)
+        return f"{LABEL}{t.rjust(4)}:{R} "
 
     upct = 0 if used is None else int(used)
-    cur_tok = (ctx.get("total_input_tokens") or 0) + (
-        ctx.get("total_output_tokens") or 0
-    )
+    in_raw = ctx.get("total_input_tokens") or 0
+    out_raw = ctx.get("total_output_tokens") or 0
     # Update the token store ONCE up front; both the burn stat (below) and the
     # Gauges section derive from it — no separate burn-rate file.
-    rows, day_rows, cnow = record_tokens(sid, cur_tok)
-    cum_tok = rows[-1][1] if rows else 0
+    rows, day_rows, cnow = record_tokens(sid, in_raw, out_raw)
+    cum_tok = (rows[-1][1] + rows[-1][2]) if rows else 0
 
     # Each section is its own block of lines, so the layout can stack them
     # (vertical) or place them in two columns (horizontal). Building them
     # separately changes nothing about their content — only how they're assembled.
 
     # ═══ Claude Code ═══
+    # The model gets its own row with thinking (on/off) beside it; effort is its own
+    # row below. No emoji here on purpose — a wide glyph like 🧠 renders as 1 cell on
+    # some terminals and 2 on others, which would knock the horizontal layout's
+    # column alignment off by a cell.
     sec_cc = [hdr("Claude Code:", ORANGE)]
 
+    # model on its own row, with thinking (on/off) to its right
     lm = f"{IND}{lbl('model')}{ORANGE}{BOLD}{model}{R}"
-    if thinking:
-        lm += " 🧠"
-    if style:
-        lm += f"   {lbl('style')}{ORANGE}{style}{R}"
+    if thinking is not None:
+        tv = f"{ORANGE}{BOLD}on{R}" if thinking else f"{DIM}off{R}"
+        lm += f"   {lbl('thinking')}{tv}"
     sec_cc.append(lm)
 
     # effort as radio buttons — the active level is bracketed (a live INDICATOR,
@@ -679,35 +779,44 @@ def _render(d):
                 cl += f"   {lbl('last commit')}{GH}{age}{R}"
             sec_git.append(f"{IND}{cl}")
 
-    # ═══ Gauges — multi-timescale token-consumption charts ════
+    # ═══ Gauges — the read/write "mirror" chart ═══
     # rows / day_rows / cnow come from the single record_tokens call up top.
-    sec_gauge = [hdr("Gauges:", EFF)]
+    # Each row reads:  <label> <reading#> ▏<chart>▕ <writing#> — the reading total
+    # sits on the reading (left) side, the writing total on the writing (right) side,
+    # and the ▏ ▕ rails frame exactly where the chart starts and ends.
+    _cw = 2 * HALF + 1  # chart width incl. the center divider
+    _RN = 6  # reading-number field width (right-aligned, just left of the chart)
+    sec_gauge = [
+        f"{hdr('Gauges:', EFF)} \033[38;5;208mreading{R}"
+        + " " * (_RN + 1 + 1 + _cw + 1 + 1 - len("reading"))
+        + f"\033[38;5;45mwriting{R}"
+    ]
 
-    # tps: an LED throttle-tachometer — gradient fill (green low → amber → red)
-    # grows with tokens/sec (trailing-window rate so it drains back as work quiets)
-    tw = tps_windowed(rows, cnow)
-    sec_gauge.append(f"{IND}{glabel('tps')}{speedo(tw)} {DIM}{ktok(round(tw))}/s{R}")
-
-    # each window: self-normalized sparkline (shape) + total consumed (magnitude)
-    def window_total(src, span_s):
-        return max(0, _cum_at(src, cnow) - _cum_at(src, cnow - span_s))
-
-    for lab, span, unit in (
-        ("1m", 60, "TPM"),
-        ("10m", 600, "TP10M"),
-        ("1h", 3600, "TPH"),
-    ):
-        s = bucket_series(rows, cnow, span, 12)
-        chart = f"{EFF}{spark(s)}{R}" if s else DASH
-        sec_gauge.append(
-            f"{IND}{glabel(lab)}{chart} {DIM}{ktok(window_total(rows, span))} {unit}{R}"
+    def grow(label, chart, rnum, wnum):
+        return (
+            f"{IND}{glabel(label)}{DIM}{rnum:>{_RN}}{R} "
+            f"{_EDL}{chart}{_EDR} {DIM}{wnum}{R}"
         )
 
-    sd = bucket_series(day_rows, cnow, 86400, 12)
-    cd = f"{EFF}{spark(sd)}{R}" if sd else DASH
+    # the mirror chart: '1s' is the live tps tach split read|write; the rows below
+    # are the butterfly history — reading (warm) left, writing (cool) right, newest
+    # in the center, oldest at both edges.
+    read_r = ema_rate(rows, cnow, IN, 3)  # short EMA: live but not strobing
+    write_r = ema_rate(rows, cnow, OUT, 3)
     sec_gauge.append(
-        f"{IND}{glabel('1d')}{cd} {DIM}{ktok(window_total(day_rows, 86400))} TPD{R}"
+        grow(
+            "1s",
+            mirror_tach(read_r, write_r),
+            ktok(round(read_r)),
+            ktok(round(write_r)),
+        )
     )
+
+    for lab, span in (("1m", 60), ("10m", 600), ("4h", 14400), ("1d", 86400)):
+        src = day_rows if span > 3600 else rows
+        i = max(0, _cum_at(src, cnow, IN) - _cum_at(src, cnow - span, IN))
+        o = max(0, _cum_at(src, cnow, OUT) - _cum_at(src, cnow - span, OUT))
+        sec_gauge.append(grow(lab, mirror_hist(src, cnow, span), ktok(i), ktok(o)))
 
     # ═══ Usage — rate-limit budgets as bars ═══════════════════
     sec_use = []
@@ -738,6 +847,13 @@ def _render(d):
 
 
 _USAGE = """revline — a rich status line for Claude Code
+
+Four sections in the footer:
+  Claude Code  model · thinking · effort · session · cost · context · cache/burn/api
+  Git          repo (clickable) · branch · ahead/behind · PR · dirty · last-commit age
+  Gauges       the read/write "mirror" — tokens READ (input, warm, left) vs WRITTEN
+               (output, cool, right) over time, at 1s / 1m / 10m / 4h / 1d
+  Usage        5h / 7d rate-limit budgets as bars
 
 Rendering (Claude Code runs this for you; it reads the session JSON on stdin):
   revline                 render the status line
