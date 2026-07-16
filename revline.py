@@ -7,23 +7,28 @@
 #   Claude Code:  model · thinking · effort · session · cost · context · cache/burn/api
 #   Git:          repo (clickable) · branch · ↑↓ upstream · PR · staged/mod/new · last-commit age
 #   Gauges:       the read/write "mirror" — a butterfly of tokens READ (input) vs
-#                 WRITTEN (output) over time, at 1s / 1m / 10m / 4h / 1d
+#                 WRITTEN (output): a live tps needle + a timeline at 1m/10m/4h/1d
 #   Usage:        5h / 7d rate-limit budgets as bars (the Max-plan runway)
 #
-# The mirror, per row:  <span>  <read#> ▏<chart>▕ <write#>
+# The mirror, per row:  <label>  <read#> ▏<chart>▕ <write#>
 #   • Reading (input, incl. cache) is WARM and fills the left half from the center
 #     outward; writing (output) is COOL and fills the right half. A dim │ marks
 #     "now" at the center; the ▏ ▕ rails frame the chart. Newest is at the center,
 #     oldest at the outer edges. 12 cells per side.
-#   • '1s' is a LIVE tachometer (an EMA-smoothed current rate); the rows below are
-#     HISTORY (each cell one time-bucket). Both height and hue rise with throughput.
+#   • 'tps' is the LIVE tokens-per-second needle (how fast right now, EMA-smoothed);
+#     the rows below are the TIMELINE (each cell one time-bucket). Both height and hue
+#     rise with throughput.
 #
 # Design notes:
 #   • Color encodes MEANING: brand colors group by system (Claude coral, GitHub
 #     green); usage % uses a green→yellow→red HEALTH scale; the mirror uses WARM
 #     for reading, COOL for writing, brighter/taller = higher throughput.
-#   • The mirror's scale is FIXED (a constant reference rate), so a given
-#     throughput always looks the same over time — colors don't drift with the peak.
+#   • ONE calibrated scale for the whole mirror: every row — the live 'tps' needle
+#     and the 1m/10m/4h/1d timeline — plots throughput RATE (tokens/sec) against the
+#     same reference, so a response STREAMS IN at the center of every row like the
+#     needle and nothing strobes as the window slides. That reference is not
+#     hardcoded: revline learns it per-machine as mean + 2σ of the token flow it
+#     actually observes (see _full_scales) — the bars fit YOUR usage, not a guess.
 #   • Repo + PR are OSC 8 hyperlinks — Cmd-click to open on GitHub.
 #   • Git is cached per session (12s TTL) so a big dirty repo never lags renders.
 #
@@ -145,14 +150,7 @@ def link(url, text):
     return f"\033]8;;{url}{st}{text}\033]8;;{st}"
 
 
-SPARK = "▁▂▃▄▅▆▇█"
-
-
-def spark(vals):
-    """Render a 0–100 series as a Unicode sparkline (a mini line graph)."""
-    return "".join(
-        SPARK[round(max(0, min(100, v)) / 100 * (len(SPARK) - 1))] for v in vals
-    )
+SPARK = "▁▂▃▄▅▆▇█"  # 8 heights — indexed directly by the mirror cells / tach
 
 
 def _atomic_write(path, text):
@@ -204,7 +202,12 @@ def _gc():
         _atomic_write(marker, str(int(now)))
         for f in glob.glob(os.path.join(TMP, "cc-statusline-*")):
             try:
-                if now - os.path.getmtime(f) > 86400:
+                # state files expire after a day idle; but a `.tmp.PID` file is an
+                # orphaned atomic-write scratch (left only if a render was SIGKILLed
+                # between open() and os.replace()) — pure garbage, so sweep it after
+                # an hour rather than making it wait the full day.
+                age = now - os.path.getmtime(f)
+                if age > 86400 or (".tmp." in os.path.basename(f) and age > 3600):
                     os.remove(f)
             except Exception:
                 pass
@@ -212,18 +215,106 @@ def _gc():
         pass
 
 
-def record_tokens(sid, in_raw, out_raw):
+# Per-machine scale auto-calibration. Rather than hardcode a full-scale rate (which
+# would be wrong on any machine/plan/usage but the one it was tuned on), revline
+# records the REAL per-event token flow to a gitignored log and derives each gauge's
+# full-scale from it as mean + 2σ of the observed values — so ~97.5% of activity fits
+# under the top of the bar and a genuine burst pins it. The log is one append-only
+# line per activity event ("epoch,read,write"); idle events (both 0) are skipped so
+# it's pure signal. Both files live next to this script (found via realpath, so they
+# land beside revline no matter which project the session runs in) and are gitignored.
+# The log self-prunes to the most recent _RATE_LOG_KEEP lines (~120 KB), which is all
+# the calibration ever reads — so it never hoards data it won't use.
+_RATE_LOG_KEEP = 5000  # lines retained (~120 KB); the whole file feeds the fit
+_RATE_LOG_TRIM_AT = 200_000  # when the file passes ~200 KB, trim it back to _KEEP lines
+_SCALE_TTL = 300  # recompute the fit from the log at most once every 5 min (then cache)
+_SCALE_MIN_N = 25  # need at least this many samples per side before trusting the fit
+
+
+def _log_rate(t, read, write):
+    """Append one activity sample to the gitignored rate log, then keep it small: once
+    the file passes _RATE_LOG_TRIM_AT it's rewritten to just the most recent
+    _RATE_LOG_KEEP lines (rare, so cheap). Best-effort — a single small line write is
+    atomic enough for the occasional concurrent session, and any error is swallowed so
+    logging never disturbs a render."""
+    if read <= 0 and write <= 0:
+        return
+    try:
+        path = os.path.join(_here(), "token_rates.log")
+        with open(path, "a") as fh:
+            fh.write(f"{t},{int(read)},{int(write)}\n")
+        if os.path.getsize(path) > _RATE_LOG_TRIM_AT:
+            kept = open(path).read().splitlines()[-_RATE_LOG_KEEP:]
+            _atomic_write(path, "\n".join(kept) + "\n")
+    except Exception:
+        pass
+
+
+def _full_scales():
+    """Per-machine full-scale rates (read, write) for the gauges: mean + 2σ of the
+    recently observed token flow, so the bars fit THIS machine instead of a hardcoded
+    guess. Derived from the whole token_rates.log (self-pruned to ~5000 lines), then
+    cached to token_rates.scale for _SCALE_TTL seconds so the log is parsed at most
+    once every few minutes (per render just reads the tiny cache). Until a side has
+    _SCALE_MIN_N samples it falls back to the DEFAULT; a floor keeps a quiet machine's
+    scale from collapsing to near-zero. Best-effort — any error returns the defaults."""
+    here = _here()
+    cache = os.path.join(here, "token_rates.scale")
+    now = time.time()
+    try:
+        if os.path.exists(cache) and now - os.path.getmtime(cache) < _SCALE_TTL:
+            fr, fw = open(cache).read().split(",")[:2]
+            return float(fr), float(fw)
+    except Exception:
+        pass
+
+    def fit(xs, default):
+        if len(xs) < _SCALE_MIN_N:
+            return float(default)
+        mean = sum(xs) / len(xs)
+        sd = (sum((x - mean) ** 2 for x in xs) / len(xs)) ** 0.5
+        return max(default * 0.25, mean + 2 * sd)  # 2σ over the mean; floored
+
+    fr, fw = float(_FULL_READ_DEFAULT), float(_FULL_WRITE_DEFAULT)
+    try:
+        path = os.path.join(here, "token_rates.log")
+        reads, writes = [], []
+        if os.path.exists(path):
+            for ln in open(path).read().splitlines():  # whole file (self-limited)
+                p = ln.split(",")
+                if len(p) == 3:
+                    r, w = int(p[1]), int(p[2])
+                    if r > 0:
+                        reads.append(r)
+                    if w > 0:
+                        writes.append(w)
+        fr = fit(reads, _FULL_READ_DEFAULT)
+        fw = fit(writes, _FULL_WRITE_DEFAULT)
+        _atomic_write(cache, f"{fr:.1f},{fw:.1f},{int(now)}")
+    except Exception:
+        pass
+    return fr, fw
+
+
+def record_tokens(sid, in_raw, out_raw, size=None):
     """Update the token stores and return (fine_rows, day_rows, now). in_raw/out_raw
-    are the MOST-RECENT RESPONSE's input and output tokens (Claude Code's
+    are the CURRENT-RESPONSE input and output tokens (Claude Code's
     total_input_tokens / total_output_tokens are per-response snapshots since
-    v2.1.132, NOT cumulative). Since each response READ in_raw tokens (input incl.
-    cache reads) and WROTE out_raw, we ACCUMULATE them into running sums here — the
-    only place a cumulative token history exists — so every gauge draws from one
-    store. Rows are (t, in_cum, out_cum, in_raw, out_raw). Two stores: a fine one
+    v2.1.132, NOT cumulative). We build the only cumulative token history that
+    exists here so every gauge draws from one store — but the two sides accumulate
+    DIFFERENTLY (see the `changed` block): input is a per-turn FLOW counted once per
+    turn, output is a per-response counter summed as a sawtooth. Rows are
+    (t, in_cum, out_cum, in_raw, out_raw). Two stores: a fine one
     (1 h, written on every change) drives the seconds/1m/10m rows; a throttled coarse
     one (25 h, ≥120 s between writes) drives the 4h/1d rows without unbounded row
-    growth at 1 s refresh."""
+    growth at 1 s refresh. `size` (context window) clamps in_raw as a guard: input
+    can never exceed the window, so if the per-response premise ever broke and the
+    field went cumulative, this bounds the damage to one window/turn instead of
+    letting a millions-token cumulative explode every reading gauge — and it never
+    touches correct data, where in_raw ≤ size already holds."""
     now = int(time.time())
+    if size and size > 0:
+        in_raw = min(in_raw, size)  # hard invariant, not a heuristic: input ≤ window
     fpath = os.path.join(TMP, f"cc-statusline-io-{sid}")
     dpath = os.path.join(TMP, f"cc-statusline-ioday-{sid}")
     fine = [r for r in _read_store(fpath) if len(r) >= 5]  # ignore torn short rows
@@ -232,12 +323,10 @@ def record_tokens(sid, in_raw, out_raw):
     else:
         in_cum = out_cum = 0
         prev_in = prev_out = None
-    # The snapshot only moves when a new response lands, so at 1s refresh ~99% of
-    # renders are unchanged — only append + rewrite when a raw total actually moved,
-    # which also means we add each response's tokens exactly ONCE. This keeps the
-    # store to change-points only (~100 rows/hr, not 3600), so reads/bucketing stay
-    # cheap. Summing (not delta-ing) the snapshots is robust to /compact resets: a
-    # smaller post-compact in_raw just adds a smaller amount, never a negative.
+    # A snapshot only moves when a response streams or a new turn lands, so at 1s
+    # refresh most renders are unchanged — only append + rewrite when a raw total
+    # actually moved. This keeps the store to change-points only (~100 rows/hr, not
+    # 3600), so reads/bucketing stay cheap.
     # NOTE: this read-modify-write is not locked. The render fires on both the 1s
     # timer and after a message, so two instances can overlap; _atomic_write keeps
     # the file itself intact (never a torn read), but the later os.replace can drop
@@ -246,10 +335,30 @@ def record_tokens(sid, in_raw, out_raw):
     # Windows portability above, so we accept the cosmetic gap rather than add one.
     changed = prev_in is None or in_raw != prev_in or out_raw != prev_out
     if changed:
-        in_cum += in_raw  # each new response read in_raw (incl. cache) …
-        out_cum += out_raw  # … and wrote out_raw; sum, don't delta (snapshots)
+        # in_raw and out_raw are DIFFERENT kinds of per-response snapshot, so they
+        # accumulate differently:
+        #   • input is re-read WHOLE each turn (a FLOW — this is why reading ~100×
+        #     writing): count in_raw ONCE per turn, i.e. only when the turn's
+        #     context actually changed. The status line re-fires ~1s DURING a
+        #     response with in_raw unchanged (only out_raw growing); adding in_raw
+        #     on those restreams was a ~2× reading over-count. A /compact DROP still
+        #     changes in_raw, so the (smaller) context is counted once — reset-safe.
+        #   • output is a per-RESPONSE cumulative counter that grows mid-stream and
+        #     resets to ~0 each new turn: sum the SAWTOOTH (rise → the delta, drop →
+        #     the new value) so each response's final output is counted exactly once,
+        #     not once per mid-stream sample (which over-counts up to ~6× on long
+        #     replies). Two genuine turns with an identical unchanged in_raw undercount
+        #     the read by one turn — rare, since context almost always grows.
+        if prev_in is None:
+            read_add, write_add = in_raw, out_raw
+        else:
+            read_add = in_raw if in_raw != prev_in else 0
+            write_add = out_raw - prev_out if out_raw >= prev_out else out_raw
+        in_cum += read_add
+        out_cum += write_add
         fine.append((now, in_cum, out_cum, in_raw, out_raw))
         fine = [r for r in fine if r[0] >= now - 3660]
+        _log_rate(now, read_add, write_add)  # empirical scale-calibration log
         _write_store(fpath, fine)
     day = [r for r in _read_store(dpath) if len(r) >= 5]
     if changed and (not day or now - day[-1][0] >= 120):
@@ -284,15 +393,24 @@ def _cum_at(rows, ts, val=TOT):
     return c
 
 
-def bucket_series(rows, now, span_s, buckets=12, val=TOT, nominal=None):
-    """0–100 per-bucket intensity of `val` over the last span_s seconds. With
-    `nominal` (tokens/sec), each bucket is scaled against a FIXED reference — a
-    bucket sustaining `nominal` tokens/sec reads ~100 — so a given throughput
-    always looks the same over time (stable color + height) instead of drifting
-    as the window's own peak changes. Without it, falls back to per-window peak
-    normalization. Any active bucket floors to a visible level. [] when nothing
-    was consumed. One forward pass — O(rows + buckets), not O(rows × buckets)."""
-    if not rows:
+def bucket_series(rows, now, span_s, buckets=12, val=TOT, full=None):
+    """0–100 per-bucket intensity of `val` over the last span_s seconds, as each
+    bucket's average RATE (tokens/sec) on the SAME fixed absolute scale as the live
+    '1s' tach (log vs `full` tok/s). Three properties fall out of "fixed + rate",
+    and each fixed a real bug:
+      • FIXED (not a per-window peak/mean) → the reference never changes render to
+        render, so the colours don't strobe as the sliding window shifts (the
+        "1m bounces red↔orange" bug a relative scale caused).
+      • RATE, not raw tokens → the newest bucket GROWS IN as a response streams (its
+        rate climbs as tokens land in the [now-slot, now] window), exactly mirroring
+        the 1s needle instead of snapping to full — the "1m doesn't stream like 1s"
+        bug.
+      • Rate is time-normalized, so ONE scale reads consistently from 1m to 1d (a
+        burst simply averages down over a wider bucket) — the tach and every history
+        row now mean the same thing.
+    Any active bucket floors to a visible minimum; 0 stays blank. [] when nothing was
+    consumed (or no `full` given). One forward pass — O(rows + buckets)."""
+    if not rows or not full:
         return []
     slot = span_s / buckets
     edges = [now - (buckets - i) * slot for i in range(buckets + 1)]
@@ -302,16 +420,13 @@ def bucket_series(rows, now, span_s, buckets=12, val=TOT, nominal=None):
             c = val(rows[j])
             j += 1
         cums.append(c)
-    deltas = [max(0, cums[i + 1] - cums[i]) for i in range(buckets)]
-    ref = nominal * slot if nominal else (max(deltas) if deltas else 0)
-    if ref <= 0:
-        return []
+    lf = math.log1p(full)  # fixed full-scale rate → same log curve as the tach
     out = []
-    for d in deltas:  # 0 stays 0 (idle → blank); any activity floors to visible
+    for i in range(buckets):
+        rate = max(0, cums[i + 1] - cums[i]) / slot  # tokens/sec in this bucket
+        # 0 → blank (idle); any activity floors to a visible 15 so a faint bucket shows
         out.append(
-            0
-            if d <= 0
-            else max(20, min(100, round(100 * math.log1p(d) / math.log1p(ref))))
+            0 if rate <= 0 else max(15, min(100, round(100 * math.log1p(rate) / lf)))
         )
     return out
 
@@ -348,11 +463,18 @@ HALF = 12
 # color walks up its ramp with magnitude, so busier = brighter.
 _WARM = [52, 88, 124, 166, 202, 208, 214, 220]  # mirror reading (input) — warm
 _COOLH = [17, 18, 24, 31, 38, 44, 45, 51]  # mirror writing (output) — cool
-# fixed full-scale rates (tokens/sec): the "constant peak" that reads as full/bright.
-# Reading (input incl. cache) runs ~100× writing, so each side has its own — and
-# because the scale is FIXED, a given throughput always looks the same over time.
-_FULL_READ = 40000
-_FULL_WRITE = 400
+# DEFAULT full-scale rates (tokens/sec) — the fallback used only until this machine
+# has logged enough activity to calibrate its OWN scale. The live scale comes from
+# _full_scales() (mean + 2σ of the observed token flow), so revline fits whatever
+# rates YOUR machine/plan/usage actually produce instead of a hardcoded guess. These
+# seed it: reading is dominated by whole-context cache re-reads each turn (tens of
+# thousands of tok/s → ~40k), output streams at a few hundred tok/s (→ 400).
+_FULL_READ_DEFAULT = 40000
+_FULL_WRITE_DEFAULT = 400
+# tps needle responsiveness: the EMA halflife in seconds — how fast old activity fades
+# from the live rate. Smaller = snappier (reacts to the current second), larger =
+# smoother/laggier. 1.0s is snappy and live; raise to 1.5–2.0+ to calm it down.
+_TACH_HALFLIFE = 1.0
 _SEP = "\033[38;5;240m│" + R  # dim center divider marking "now" between read | write
 _EDL = "\033[38;5;240m▏" + R  # left rail — where the chart starts (next to reading#)
 _EDR = "\033[38;5;240m▕" + R  # right rail — where the chart ends (next to writing#)
@@ -364,17 +486,17 @@ def _rampc(ramp, depth):
     return f"\033[38;5;{ramp[round(depth / max(1, HALF - 1) * (len(ramp) - 1))]}m"
 
 
-def mirror_tach(read_rate, write_rate):
-    """The live 'secs' row: the tps tachometer split down the middle. Reading fills
-    LEDs leftward from center in the WARM palette (scaled to _FULL_READ), writing
-    rightward in the COOL palette (scaled to _FULL_WRITE) — brighter toward the edge,
-    a dim divider at 'now'. Fills grow with the current rate and drain as work quiets,
-    so the needle slides both ways on a FIXED scale (same rate → same fill)."""
+def mirror_tach(read_rate, write_rate, full_read, full_write):
+    """The live 'tps' row: the tokens-per-second needle split down the middle. Reading
+    fills LEDs leftward from center in the WARM palette (scaled to full_read tok/s),
+    writing rightward in the COOL palette (scaled to full_write) — brighter toward the
+    edge, a dim divider at 'now'. Fills grow with the current rate and drain as work
+    quiets, so the needle slides both ways on the machine's calibrated scale."""
 
     def fill(rate, full):
         return round(min(1.0, math.log1p(max(0.0, rate)) / math.log1p(full)) * HALF)
 
-    lf, wf = fill(read_rate, _FULL_READ), fill(write_rate, _FULL_WRITE)
+    lf, wf = fill(read_rate, full_read), fill(write_rate, full_write)
     left = [
         (f"{_rampc(_WARM, HALF - 1 - p)}█{R}" if HALF - 1 - p < lf else " ")
         for p in range(HALF)
@@ -392,13 +514,15 @@ def _mcell(ramp, v):
     return f"\033[38;5;{c}m{SPARK[round(min(100, v) / 100 * 7)]}{R}"
 
 
-def mirror_hist(rows, now, span):
+def mirror_hist(rows, now, span, full_read, full_write):
     """A history row of the butterfly: reading (warm) runs from the far-left
     (oldest) inward to the center (newest); writing (cool) runs from the center
     (newest) out to the far-right (oldest), a dim divider at 'now'. Both sides use
-    the FIXED full-scale rates so a given throughput reads the same over time."""
-    rd = bucket_series(rows, now, span, HALF, IN, _FULL_READ) or [0] * HALF
-    wr = bucket_series(rows, now, span, HALF, OUT, _FULL_WRITE) or [0] * HALF
+    the SAME calibrated rate scale as the tps needle (full_read / full_write), so a
+    response streams IN at the center exactly like the needle and nothing strobes as
+    the window slides (see bucket_series)."""
+    rd = bucket_series(rows, now, span, HALF, IN, full_read) or [0] * HALF
+    wr = bucket_series(rows, now, span, HALF, OUT, full_write) or [0] * HALF
     left = [_mcell(_WARM, v) for v in rd]
     right = [_mcell(_COOLH, v) for v in wr[::-1]]
     return "".join(left) + _SEP + "".join(right)
@@ -444,12 +568,23 @@ def git_state(cwd, sid):
     g = {k: 0 for k in keys}
     g["repo"] = g["branch"] = g["url"] = ""
 
+    stalled = []  # set once any git call times out — see below
+
     def run(*args):
+        # If an earlier git call already timed out this render, the filesystem is
+        # slow/wedged; don't stack another 2 s wait for each of the ~6 calls (that
+        # stacks to a ~12 s footer stall). Bail instantly — the 12 s negative cache
+        # means we won't retry for a while anyway.
+        if stalled:
+            return ""
         try:
             r = subprocess.run(
                 ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=2
             )
             return r.stdout.strip() if r.returncode == 0 else ""
+        except subprocess.TimeoutExpired:
+            stalled.append(1)
+            return ""
         except Exception:
             return ""
 
@@ -600,6 +735,17 @@ def obj(x):
     return x if isinstance(x, dict) else {}
 
 
+def numf(x, default=0.0):
+    """obj()'s scalar sibling: coerce a numeric field to a float for math, so a
+    wrong-typed value (e.g. a future schema shipping a token count as the string
+    "5") can't raise mid-render and — via main()'s outer guard — blank the WHOLE
+    footer. None / non-numeric → default. float() first so both 5 and "5" work."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 def _render(d):
     # ── fields (all defensive: many are null early / absent / wrong-typed) ──
     model = obj(d.get("model")).get("display_name") or "?"
@@ -610,13 +756,17 @@ def _render(d):
     name = d.get("session_name")  # set via /rename or --name; absent when unnamed
 
     ctx = obj(d.get("context_window"))
-    used = ctx.get("used_percentage")
-    tokens = ctx.get("total_input_tokens") or 0
+    up = ctx.get("used_percentage")
+    used = None if up is None else numf(up)  # keep None (unknown early) vs a number
+    in_raw = max(0, int(numf(ctx.get("total_input_tokens"))))
+    out_raw = max(0, int(numf(ctx.get("total_output_tokens"))))
+    tokens = in_raw  # same field as total_input_tokens, already coerced
     size = ctx.get("context_window_size")
+    size = int(size) if isinstance(size, (int, float)) else None
     size_lbl = "1M" if size and size >= 1_000_000 else ("200k" if size else "")
 
     cost = obj(d.get("cost"))
-    usd = cost.get("total_cost_usd") or 0
+    usd = numf(cost.get("total_cost_usd"))
     added = cost.get("total_lines_added") or 0
     removed = cost.get("total_lines_removed") or 0
     dur_ms = cost.get("total_duration_ms") or 0
@@ -655,11 +805,11 @@ def _render(d):
         return f"{LABEL}{t.rjust(4)}:{R} "
 
     upct = 0 if used is None else int(used)
-    in_raw = ctx.get("total_input_tokens") or 0
-    out_raw = ctx.get("total_output_tokens") or 0
-    # Update the token store ONCE up front; both the burn stat (below) and the
-    # Gauges section derive from it — no separate burn-rate file.
-    rows, day_rows, cnow = record_tokens(sid, in_raw, out_raw)
+    # Update the token store ONCE up front (in_raw/out_raw coerced at the top);
+    # both the burn stat (below) and the Gauges section derive from it — no
+    # separate burn-rate file. `size` lets record_tokens clamp an implausible
+    # input to the window (a guard against the per-response premise ever breaking).
+    rows, day_rows, cnow = record_tokens(sid, in_raw, out_raw, size)
     cum_tok = (rows[-1][1] + rows[-1][2]) if rows else 0
 
     # Each section is its own block of lines, so the layout can stack them
@@ -786,10 +936,20 @@ def _render(d):
     # and the ▏ ▕ rails frame exactly where the chart starts and ends.
     _cw = 2 * HALF + 1  # chart width incl. the center divider
     _RN = 6  # reading-number field width (right-aligned, just left of the chart)
+    # The header carries the time axis BETWEEN the read and write labels: 'now' is
+    # the CENTER of every row (over the │), oldest is at both edges — time runs
+    # OUTWARD. The 25-col axis sits exactly where the charts do (its 'now' at offset
+    # 12 lands under the center divider). A row's chart starts at column
+    # IND(2)+glabel(6)+reading#(_RN)+space+rail = 16, so the read label is padded out
+    # to that column and the write label pinned two cols past the axis (the wnum
+    # column), keeping the whole header aligned to the rows below.
+    _RLAB, _WLAB = "read", "write"  # left = input (read), right = output (written)
+    _axis = f"\033[38;5;240molder ────{R} {LABEL}now{R} \033[38;5;240m──── older{R}"
+    _chart_col = 2 + 6 + _RN + 1 + 1  # IND + glabel + reading# + space + rail = 16
+    _lpad = " " * (_chart_col - len("Gauges: ") - len(_RLAB))
     sec_gauge = [
-        f"{hdr('Gauges:', EFF)} \033[38;5;208mreading{R}"
-        + " " * (_RN + 1 + 1 + _cw + 1 + 1 - len("reading"))
-        + f"\033[38;5;45mwriting{R}"
+        f"{hdr('Gauges:', EFF)} \033[38;5;208m{_RLAB}{R}{_lpad}{_axis}  "
+        f"\033[38;5;45m{_WLAB}{R}"
     ]
 
     def grow(label, chart, rnum, wnum):
@@ -798,15 +958,17 @@ def _render(d):
             f"{_EDL}{chart}{_EDR} {DIM}{wnum}{R}"
         )
 
-    # the mirror chart: '1s' is the live tps tach split read|write; the rows below
-    # are the butterfly history — reading (warm) left, writing (cool) right, newest
-    # in the center, oldest at both edges.
-    read_r = ema_rate(rows, cnow, IN, 3)  # short EMA: live but not strobing
-    write_r = ema_rate(rows, cnow, OUT, 3)
+    # the mirror: 'tps' is the live tokens-per-second needle split read|write (a
+    # RATE — "how fast right now", not a time bucket); the rows below are the timeline
+    # history — reading (warm) left, writing (cool) right, newest at center. Every row
+    # uses this machine's calibrated full-scale rates (mean + 2σ of observed flow).
+    full_read, full_write = _full_scales()
+    read_r = ema_rate(rows, cnow, IN, _TACH_HALFLIFE)  # responsiveness knob (secs)
+    write_r = ema_rate(rows, cnow, OUT, _TACH_HALFLIFE)
     sec_gauge.append(
         grow(
-            "1s",
-            mirror_tach(read_r, write_r),
+            "tps",
+            mirror_tach(read_r, write_r, full_read, full_write),
             ktok(round(read_r)),
             ktok(round(write_r)),
         )
@@ -816,7 +978,14 @@ def _render(d):
         src = day_rows if span > 3600 else rows
         i = max(0, _cum_at(src, cnow, IN) - _cum_at(src, cnow - span, IN))
         o = max(0, _cum_at(src, cnow, OUT) - _cum_at(src, cnow - span, OUT))
-        sec_gauge.append(grow(lab, mirror_hist(src, cnow, span), ktok(i), ktok(o)))
+        sec_gauge.append(
+            grow(
+                lab,
+                mirror_hist(src, cnow, span, full_read, full_write),
+                ktok(i),
+                ktok(o),
+            )
+        )
 
     # ═══ Usage — rate-limit budgets as bars ═══════════════════
     sec_use = []
@@ -880,8 +1049,11 @@ def main():
     if verb in ("vertical", "v"):
         print(_set_layout("vertical"))
         return
-    if verb in ("help", "usage") or (not verb and sys.stdin.isatty()):
-        # bare `revline` in a terminal (no piped JSON) → show help, don't hang
+    if verb in ("help", "usage") or sys.stdin.isatty():
+        # `revline help`, a bare `revline`, OR a mistyped verb in a terminal — any
+        # tty invocation that isn't a known control verb. There's no piped JSON, so
+        # show help instead of falling through to json.load(stdin), which would block
+        # the terminal forever waiting on input that never comes.
         print(_USAGE)
         return
 

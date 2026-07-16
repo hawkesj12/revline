@@ -15,7 +15,7 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 - **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets).
 - **The read/write "mirror"** — a butterfly chart of tokens **read** (input, incl. cache) vs **written** (output) over time. Reading is warm and fills the left half from the center outward; writing is cool and fills the right. Newest is at the center, oldest at the outer edges, with the reading and writing totals flanking each row.
 - **Five timescales** — `1s` is a live, EMA-smoothed tachometer of the current rate; `1m / 10m / 4h / 1d` are history. Both bar height and hue rise with throughput.
-- **A fixed color scale** — a given throughput always looks the same over time; the colors don't drift as the peak changes.
+- **One scale for the whole mirror** — every row (the live `1s` tach and the `1m / 10m / 4h / 1d` history) plots throughput _rate_ against the same fixed reference, so a response streams in at the center of each row just like the needle, the same rate always looks the same, and nothing strobes as the window slides.
 - **Two layouts, toggled live** — `vertical` (stacked) or `horizontal` (two aligned columns), switched with `revline flip` without restarting.
 - **Clickable git links** — repo and PR are OSC-8 hyperlinks in terminals that support them.
 - **Never crashes your footer** — any malformed input prints nothing and exits cleanly, rather than leaking a traceback.
