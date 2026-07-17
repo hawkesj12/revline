@@ -4,7 +4,7 @@ A rich, single-file status line for [Claude Code](https://claude.com/claude-code
 
 ![revline in horizontal layout](docs/horizontal.png)
 
-_The **mirror** splits each row down the middle: tokens **read** (input, warm) fill the left half from the center, tokens **written** (output, cool) fill the right — newest at the center, five timescales stacked (`1s` → `1d`)._
+_The **mirror** splits each row down the middle: tokens **read** (non-cache input, warm) fill the left half from the center, tokens **written** (output, cool) fill the right — newest at the center, five timescales stacked (`tps` → `1d`)._
 
 ## Why
 
@@ -13,9 +13,9 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 ## Features
 
 - **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets).
-- **The read/write "mirror"** — a butterfly chart of tokens **read** (input, incl. cache) vs **written** (output) over time. Reading is warm and fills the left half from the center outward; writing is cool and fills the right. Newest is at the center, oldest at the outer edges, with the reading and writing totals flanking each row.
-- **Five timescales** — `1s` is a live, EMA-smoothed tachometer of the current rate; `1m / 10m / 4h / 1d` are history. Both bar height and hue rise with throughput.
-- **One scale for the whole mirror** — every row (the live `1s` tach and the `1m / 10m / 4h / 1d` history) plots throughput _rate_ against the same fixed reference, so a response streams in at the center of each row just like the needle, the same rate always looks the same, and nothing strobes as the window slides.
+- **The read/write "mirror"** — a butterfly chart of tokens **read** (non-cache input, warm) vs **written** (output, cool) over time. Reading fills the left half from the center outward; writing fills the right. Newest is at the center, oldest at the outer edges, with the read and write totals flanking each row.
+- **Five timescales** — `tps` is a live, EMA-smoothed tokens-per-second needle (how fast right now); `1m / 10m / 4h / 1d` are the timeline. Both bar height and hue rise with throughput.
+- **Self-calibrating scale** — instead of a hardcoded peak, revline sets the bars' full-scale from _your own_ recent usage: 90% above your true average token rate (total tokens ÷ elapsed time, so idle counts too). One peak scales the whole mirror, linearly, so a response streams in at the center of each row just like the needle and nothing strobes as the window slides. Calibration is **per session** — each session learns from its own small, self-pruning, gitignored `token_rates-<id>.log` (a new session seeds from a recent one so it's never cold).
 - **Two layouts, toggled live** — `vertical` (stacked) or `horizontal` (two aligned columns), switched with `revline flip` without restarting.
 - **Clickable git links** — repo and PR are OSC-8 hyperlinks in terminals that support them.
 - **Never crashes your footer** — any malformed input prints nothing and exits cleanly, rather than leaking a traceback.
@@ -51,6 +51,30 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 3. **Start a session.** The footer picks it up — no restart of anything else needed.
 
 That's the whole install. Claude Code runs the command each refresh and pipes it the session JSON on stdin; `revline` reads that and prints the dashboard. It never makes a network call and costs zero API tokens (the status line is never sent to the model).
+
+### Optional: clean up session state on close
+
+revline keeps a tiny per-session store and calibration log in your temp dir and next to the script. They're bounded and self-expire after a day idle, but if you want a session's files removed the moment it closes, add a `SessionEnd` hook in the same `settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/revline.py cleanup",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code pipes the session id to `revline cleanup`, which deletes that session's files. It intentionally skips `/clear` and `resume` (the session lives on). Purely optional — the built-in garbage collection is the backstop.
 
 ### Optional: the `revline` command
 
@@ -89,7 +113,9 @@ Orientation is resolved in this order:
 
 ## What the mirror measures (read this before trusting the numbers)
 
-Each response, Claude Code reports how many tokens it **read** (input — mostly prompt-cache reads) and **wrote** (output). revline accumulates those per-response counts (they're per-response snapshots in the JSON, not cumulative) and charts reading vs writing over five timescales. **Reading dwarfs writing (~100×)** because every turn re-reads the whole context. This is a **throughput / activity** view, not a billing figure — most reading is cache (billed at a fraction of fresh input). For spend, watch the `cost: $…` line (Claude Code's own estimate) and the `cache:` hit-ratio. Tokens ≈ activity, `$` ≈ cost.
+**"Read" here means non-cache input** — the tokens the model genuinely ingests fresh each turn (new/uncached input plus tokens newly written to cache), **not** the whole context re-read from cache. Claude Code's `total_input_tokens` is that full re-read, and it's mostly cache; charting it would make reading a churn number ~100× the write side. Instead revline sums `current_usage.input_tokens + cache_creation_input_tokens`, so the read side reflects **real new work** and ends up comparable to writing. Output is `total_output_tokens`. Both are per-response snapshots (not cumulative in the JSON since v2.1.132), accumulated locally and charted over the timescales.
+
+This is a **throughput / activity** view, not a billing figure. For spend, watch the `cost: $…` line (Claude Code's own estimate) and the `cache:` hit-ratio; the `context:` line still shows the full context size (`total_input_tokens`). Tokens ≈ activity, `$` ≈ cost.
 
 ## Platform notes
 

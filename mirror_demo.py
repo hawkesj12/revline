@@ -103,14 +103,14 @@ def gauges(all_rows, now):
         + " " * (_RN + 1 + 1 + _cw + 1 + 1 - len("reading"))
         + f"\033[38;5;45mwriting{R}"
     )
-    fr, fw = rl._full_scales()
-    read_r = rl.ema_rate(rows, now, rl.IN, 3)
-    write_r = rl.ema_rate(rows, now, rl.OUT, 3)
+    full_read, full_write = rl._full_scales("demo")
+    read_r = rl.ema_rate(rows, now, rl.IN, rl._TACH_HALFLIFE)
+    write_r = rl.ema_rate(rows, now, rl.OUT, rl._TACH_HALFLIFE)
     lines = [
         header,
         grow(
             "tps",
-            rl.mirror_tach(read_r, write_r, fr, fw),
+            rl.mirror_tach(read_r, write_r, full_read, full_write),
             rl.ktok(round(read_r)),
             rl.ktok(round(write_r)),
         ),
@@ -120,7 +120,12 @@ def gauges(all_rows, now):
         i = max(0, rl._cum_at(src, now, rl.IN) - rl._cum_at(src, now - span, rl.IN))
         o = max(0, rl._cum_at(src, now, rl.OUT) - rl._cum_at(src, now - span, rl.OUT))
         lines.append(
-            grow(lab, rl.mirror_hist(src, now, span, fr, fw), rl.ktok(i), rl.ktok(o))
+            grow(
+                lab,
+                rl.mirror_hist(src, now, span, full_read, full_write),
+                rl.ktok(i),
+                rl.ktok(o),
+            )
         )
     return "\n".join(lines)
 

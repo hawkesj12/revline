@@ -4,5 +4,5 @@ __pycache__/
 revline.config.json
 .idea/
 .DS_Store
-token_rates.log
-token_rates.scale
+token_rates*.log
+token_rates*.scale
