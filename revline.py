@@ -23,13 +23,17 @@
 #   • Color encodes MEANING: brand colors group by system (Claude coral, GitHub
 #     green); usage % uses a green→yellow→red HEALTH scale; the mirror uses WARM
 #     for reading, COOL for writing, brighter/taller = higher throughput.
-#   • ONE calibrated scale for the whole mirror: every row — the live 'tps' needle
-#     and the 1m/10m/4h/1d timeline — plots throughput RATE (tokens/sec) LINEARLY
-#     against the same reference, so a response STREAMS IN at the center of every row
-#     like the needle and nothing strobes as the window slides. That reference is not
-#     hardcoded: revline learns it PER-SESSION as 90% above your true average rate —
-#     total tokens ÷ total elapsed time, idle included (see _full_scales) — so the bars
-#     fit YOUR usage, not a guess.
+#   • Each row is calibrated to ITSELF: the 1m/10m/4h/1d timeline bars plot each grid
+#     bucket's token AMOUNT linearly against that ROW's own reference — a robust
+#     percentile of how many tokens a bucket of that width actually holds on this
+#     machine (see _full_scales). So a busy bucket pegs, a typical one sits mid-bar, and
+#     a taller bar simply read MORE than its neighbours. Per-timescale is the point: a
+#     5 s bucket and a 2 h bucket hold wildly different amounts, so one shared scale
+#     can't serve both. The references are learned PER-MACHINE (pooled across sessions)
+#     and FROZEN between refreshes, so the bars are static — nothing dances render to
+#     render; only the newest (partial) bucket fills live. Buckets are grid-anchored, so
+#     the row scrolls one bucket at a time. The 'tps' needle is separate: the live
+#     tokens/sec rate against a per-second reference.
 #   • Repo + PR are OSC 8 hyperlinks — Cmd-click to open on GitHub.
 #   • Git is cached per session (12s TTL) so a big dirty repo never lags renders.
 #
@@ -52,10 +56,12 @@ import glob
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
+
+# `subprocess` is imported lazily inside git_state() — it's only needed on a git
+# cache-miss (~1 render in 12), and importing it costs ~5 ms on EVERY warm render.
 import unicodedata
 
 # Per-session state files live here. tempfile.gettempdir() (not a hardcoded
@@ -230,37 +236,53 @@ def _gc():
         pass
 
 
-# Per-session scale auto-calibration. Rather than hardcode a full-scale rate (which
-# would be wrong on any machine/plan/usage but the one it was tuned on), revline
-# records the REAL per-event token flow to a gitignored PER-SESSION log and derives the
-# gauge full-scale from it as 90% above the true average RATE (see _full_scales). The
-# log is one append-only line per activity event ("epoch,read,write"); idle events
-# (both 0) are skipped so it's pure signal, and the timestamps still carry the idle
-# gaps a true average needs. Files live next to this script (found via realpath, so
-# they land beside revline no matter which project the session runs in) and are
-# gitignored. The log self-prunes to the most recent _RATE_LOG_KEEP lines (~120 KB).
-_RATE_LOG_KEEP = 5000  # lines retained (~120 KB); the whole file feeds the fit
-_RATE_LOG_TRIM_AT = 200_000  # when the file passes ~200 KB, trim it back to _KEEP lines
-_SCALE_TTL = 300  # recompute the fit from the log at most once every 5 min (then cache)
-_SCALE_MIN_N = 6  # min samples before trusting a session's fit (else seed/default)
+# Per-MACHINE, per-TIMESCALE scale calibration. The gauge full-scale isn't hardcoded
+# (that would be wrong on any machine/plan/usage but the one it was tuned on) — revline
+# records the real token flow to a gitignored MACHINE-LEVEL history log and, for each
+# row, sets "full bar" to a robust high percentile of how many tokens a bucket of that
+# width actually holds on this machine (see _full_scales). Per-TIMESCALE is the whole
+# point: a 5 s bucket and a 2 h bucket hold wildly different amounts, so one scale can't
+# serve both — it pegs the short rows or flattens the long ones. Per-MACHINE (pooled
+# across sessions) because more history = a steadier reference, and the statistic is a
+# DISTRIBUTION of bucket sizes, not a rate over total time, so overlapping sessions
+# don't distort it. The references are FROZEN between refreshes, so a given amount
+# always maps to the same height — static, no render-to-render dancing. The log is one
+# append-only line per activity event ("epoch,read,write"); idle events (both 0)
+# skipped. Lives next to the script (realpath) and is gitignored; self-prunes.
+_RATE_LOG = "token_rates.log"  # the machine's throughput memory (the calibration data)
+_SCALE_CACHE = "token_rates.scale"  # the frozen per-timescale references (JSON)
+_RATE_LOG_KEEP = 20000  # lines retained — enough history for the long (4h/1d) rows
+_RATE_LOG_TRIM_AT = (
+    800_000  # trim (to _KEEP lines) once the file passes ~this many bytes
+)
+_SCALE_TTL = 1800  # refresh the frozen references at most every 30 min (else static)
+_SCALE_MIN_N = 8  # min active buckets before trusting a row's fit (else scaled default)
+
+# (span_seconds, bucket_slot_seconds, percentile). The percentile is the "how full is
+# full" knob — lower = fuller/livelier bars (a typical bucket reads high), higher =
+# only your busiest buckets peg. 1m is lower so the short row isn't too quiet. The
+# leading span=1 entry is NOT a timeline row — it's the tps needle's own per-SECOND
+# reference (a busy second's tokens), so the live rate isn't scaled off a 5 s bucket ÷ 5
+# (which pegged the needle on a median turn, since a turn's tokens land in a lump).
+_SCALE_SPECS = (
+    (1, 1, 80),
+    (60, 5, 70),
+    (600, 50, 80),
+    (14400, 1200, 88),
+    (86400, 7200, 90),
+)
 
 
-def _rate_log_path(sid):
-    """Per-SESSION rate log. One shared log would mix concurrent sessions' activity and
-    ~double the true average rate (two sessions' tokens over the same span), so each
-    session calibrates from its own file."""
-    return os.path.join(_here(), f"token_rates-{sid}.log")
-
-
-def _log_rate(sid, t, read, write):
-    """Append one activity sample to this session's gitignored rate log, then keep it
-    small: once the file passes _RATE_LOG_TRIM_AT it's rewritten to just the most recent
-    _RATE_LOG_KEEP lines (rare, so cheap). Best-effort — any error is swallowed so
-    logging never disturbs a render."""
+def _log_rate(t, read, write):
+    """Append one activity sample to the machine-level history log, then keep it small:
+    once it passes _RATE_LOG_TRIM_AT it's rewritten to the most recent _RATE_LOG_KEEP
+    lines. One shared log is fine — calibration is a distribution of bucket sizes, not a
+    rate over total time, so concurrent sessions don't distort it. Best-effort: any
+    error is swallowed so logging never disturbs a render."""
     if read <= 0 and write <= 0:
         return
     try:
-        path = _rate_log_path(sid)
+        path = os.path.join(_here(), _RATE_LOG)
         with open(path, "a") as fh:
             fh.write(f"{t},{int(read)},{int(write)}\n")
         if os.path.getsize(path) > _RATE_LOG_TRIM_AT:
@@ -270,69 +292,84 @@ def _log_rate(sid, t, read, write):
         pass
 
 
-_PEAK_FACTOR = 1.9  # full-scale = this × the average observed rate (90% above average)
+def _pctl(sorted_vals, p):
+    """p-th percentile of a pre-sorted list (nearest-rank, clamped). 0.0 when empty."""
+    if not sorted_vals:
+        return 0.0
+    return float(
+        sorted_vals[min(len(sorted_vals) - 1, int(p / 100 * len(sorted_vals)))]
+    )
 
 
-def _seed_scale(here):
-    """Cold-start scale for a session with too little data of its own: borrow the most
-    recently written OTHER session's scale (your real baseline), else the raw default.
-    Keeps a brand-new session's bars sane for the first few minutes until it calibrates
-    to itself."""
-    try:
-        caches = glob.glob(os.path.join(here, "token_rates-*.scale"))
-        if caches:
-            fr, fw = open(max(caches, key=os.path.getmtime)).read().split(",")[:2]
-            return float(fr), float(fw)
-    except Exception:
-        pass
-    return float(_FULL_READ_DEFAULT), float(_FULL_WRITE_DEFAULT)
-
-
-def _full_scales(sid):
-    """ONE calibrated full-scale RATE per side (read, write) for the WHOLE mirror —
-    _PEAK_FACTOR × THIS SESSION's true average tokens/sec (i.e. 90% above average). The
-    average is TIME-weighted: total tokens ÷ total elapsed seconds, so it counts the
-    IDLE time too. That matters — the log only records active moments (idle seconds are
-    dropped), so averaging the logged values alone would be "average while busy", far
-    too high; dividing by the real elapsed span (the timestamps still hold the idle
-    gaps) gives a true per-second rate the needle and every bucket can be compared to.
-    Per-session (see _rate_log_path): a shared log would double the rate under two
-    concurrent sessions. Cached per session for _SCALE_TTL secs; until this session has
-    _SCALE_MIN_N samples it seeds from the newest other session's scale. Best-effort."""
+def _full_scales():
+    """FROZEN per-machine, per-timescale full-scale AMOUNTS — one (read_full, write_full)
+    per timeline span. For each span, bin the machine history into that row's bucket
+    width and take a robust percentile of the ACTIVE (non-empty) bucket amounts: how
+    many tokens a busy bucket holds, so a typical bucket lands mid-bar and only the
+    busiest peg (a taller bar read more than its neighbours). Returns {span: (fr, fw)}.
+    Cached to _SCALE_CACHE and held constant for _SCALE_TTL secs → the bars are static.
+    A row with < _SCALE_MIN_N active buckets falls back to the per-second default scaled
+    to its slot. Reads token_rates*.log (the machine log + any legacy per-session logs
+    still on disk) so history isn't lost on the switch. Best-effort."""
     here = _here()
-    cache = os.path.join(here, f"token_rates-{sid}.scale")
+    cache = os.path.join(here, _SCALE_CACHE)
     now = time.time()
     try:
         if os.path.exists(cache) and now - os.path.getmtime(cache) < _SCALE_TTL:
-            fr, fw = open(cache).read().split(",")[:2]
-            return float(fr), float(fw)
+            d = json.loads(open(cache).read())
+            return {int(k): tuple(v) for k, v in d.items()}
     except Exception:
         pass
 
-    fr = fw = None
+    # default per-row full = the per-second default scaled to that bucket's width
+    out = {
+        span: (float(_FULL_READ_DEFAULT * slot), float(_FULL_WRITE_DEFAULT * slot))
+        for span, slot, _ in _SCALE_SPECS
+    }
     try:
-        path = _rate_log_path(sid)
         events = []
-        if os.path.exists(path):
-            for ln in (
-                open(path).read().splitlines()
-            ):  # this session's log (self-limited)
+        for path in glob.glob(os.path.join(here, "token_rates*.log")):
+            for ln in open(path).read().splitlines():
                 p = ln.split(",")
                 if len(p) == 3:
-                    events.append((int(p[0]), int(p[1]), int(p[2])))
-        if len(events) >= _SCALE_MIN_N:
-            span = max(1, events[-1][0] - events[0][0])  # secs, INCLUDING idle gaps
-            fr = _PEAK_FACTOR * (sum(r for _, r, _ in events) / span)  # true tok/sec
-            fw = _PEAK_FACTOR * (sum(w for _, _, w in events) / span)
+                    try:  # skip ONE torn/garbled line, don't abandon all calibration
+                        events.append((int(p[0]), int(p[1]), int(p[2])))
+                    except ValueError:
+                        continue
+        events.sort()  # for the tps needle's consecutive-event rate
+        # tps needle (span=1): percentile of the INSTANTANEOUS rate (read ÷ gap-seconds),
+        # which is what ema_rate actually displays — NOT per-second token sums (a turn's
+        # tokens land in one lump, so summing them pegged the needle). dt filtered to
+        # real gaps (skip sub-second and cross-session mega-gaps).
+        rrate, wrate = [], []
+        prev = None
+        for t, r, w in events:
+            if prev is not None and 1 <= t - prev <= 300:
+                if r:
+                    rrate.append(r / (t - prev))
+                if w:
+                    wrate.append(w / (t - prev))
+            prev = t
+        rrate.sort()
+        wrate.sort()
+        for span, slot, pctl in _SCALE_SPECS:
+            if span == 1:
+                rv, wv = rrate, wrate  # instantaneous rates (tok/sec)
+            else:  # timeline row: per-bucket token amounts at this slot width
+                rb, wb = {}, {}
+                for t, r, w in events:
+                    if r:
+                        rb[t // slot] = rb.get(t // slot, 0) + r
+                    if w:
+                        wb[t // slot] = wb.get(t // slot, 0) + w
+                rv, wv = sorted(rb.values()), sorted(wb.values())
+            fr = _pctl(rv, pctl) if len(rv) >= _SCALE_MIN_N else out[span][0]
+            fw = _pctl(wv, pctl) if len(wv) >= _SCALE_MIN_N else out[span][1]
+            out[span] = (max(1.0, fr), max(1.0, fw))
+        _atomic_write(cache, json.dumps({str(k): list(v) for k, v in out.items()}))
     except Exception:
         pass
-    if fr is None:  # not enough of its own data yet → seed from a recent session
-        fr, fw = _seed_scale(here)
-    try:
-        _atomic_write(cache, f"{fr:.1f},{fw:.1f},{int(now)}")
-    except Exception:
-        pass
-    return fr, fw
+    return out
 
 
 def record_tokens(sid, in_raw, out_raw, size=None):
@@ -397,7 +434,7 @@ def record_tokens(sid, in_raw, out_raw, size=None):
         out_cum += write_add
         fine.append((now, in_cum, out_cum, in_raw, out_raw))
         fine = [r for r in fine if r[0] >= now - 3660]
-        _log_rate(sid, now, read_add, write_add)  # per-session calibration log
+        _log_rate(now, read_add, write_add)  # machine-level calibration history
         _write_store(fpath, fine)
     day = [r for r in _read_store(dpath) if len(r) >= 5]
     if changed and (not day or now - day[-1][0] >= 120):
@@ -433,22 +470,24 @@ def _cum_at(rows, ts, val=TOT):
 
 
 def bucket_series(rows, now, span_s, buckets=12, val=TOT, full=None):
-    """0–100 per-bucket intensity of `val` over the last span_s seconds, as each
-    bucket's average RATE (tokens/sec) scaled LINEARLY against `full` — the session's
-    one calibrated peak (see _full_scales). Three properties, each fixing a real bug:
-      • FIXED peak (not a per-window peak/mean) → the reference doesn't change render
-        to render, so colours don't strobe as the window slides (the "1m bounces
-        red↔orange" bug a per-render relative scale caused).
-      • RATE, not raw tokens → the newest bucket GROWS IN as a response streams (its
-        rate climbs as tokens land in [now-slot, now]) exactly like the needle.
-      • LINEAR (not log) → a normal bucket sits mid-bar with headroom, so reads stop
-        pegging at the top; log compression was pinning every active read near full.
+    """0–100 per-bucket intensity of `val` over the last span_s seconds — each bucket's
+    total tokens as a LINEAR fraction of `full` (this timescale's frozen per-machine
+    reference; see _full_scales). Two properties:
+      • GRID-ANCHORED buckets — edges snap to fixed slot boundaries, so the row scrolls
+        one whole bucket at a time when time crosses a boundary, instead of every bucket
+        creeping every render. Only the newest (partial) bucket fills live; the rest sit
+        still. That's what makes it STATIC — no dancing.
+      • AMOUNT vs a per-timescale reference — a taller bar simply read MORE than its
+        neighbours; a typical bucket lands mid-bar and only a busy one pegs, because
+        `full` is sized to this row's own bucket width.
     Any active bucket floors to a visible minimum; 0 stays blank. [] when nothing was
-    consumed (or no `full` given). One forward pass — O(rows + buckets)."""
+    consumed (or no `full`). One forward pass — O(rows + buckets)."""
     if not rows or not full:
         return []
     slot = span_s / buckets
-    edges = [now - (buckets - i) * slot for i in range(buckets + 1)]
+    nb = int(now // slot)  # grid-aligned index of the current slot
+    # 12 grid buckets ending at 'now'; the last one runs from its slot boundary to now
+    edges = [(nb - (buckets - 1) + i) * slot for i in range(buckets)] + [now]
     cums, j, c = [], 0, 0
     for e in edges:  # carry-forward cumulative at each bucket edge, single walk
         while j < len(rows) and rows[j][0] <= e:
@@ -457,9 +496,14 @@ def bucket_series(rows, now, span_s, buckets=12, val=TOT, full=None):
         cums.append(c)
     out = []
     for i in range(buckets):
-        rate = max(0, cums[i + 1] - cums[i]) / slot  # tokens/sec in this bucket
+        amt = max(0, cums[i + 1] - cums[i])  # tokens in this bucket
+        # the newest bucket is PARTIAL (its slot isn't over yet), so judge it against a
+        # reference scaled to its elapsed fraction — else it under-reads a steady rate
+        # (badly on the long rows: a 2 h bucket reads ~0 for its first hour) and pulses
+        # 0→full each tick. Full-width buckets use `full` unchanged (frac = 1).
+        ref = full * max(0.12, (edges[i + 1] - edges[i]) / slot)
         # 0 → blank (idle); any activity floors to a visible 12 so a faint bucket shows
-        out.append(0 if rate <= 0 else max(12, min(100, round(100 * rate / full))))
+        out.append(0 if amt <= 0 else max(12, min(100, round(100 * amt / ref))))
     return out
 
 
@@ -495,11 +539,10 @@ HALF = 12
 # color walks up its ramp with magnitude, so busier = brighter.
 _WARM = [52, 88, 124, 166, 202, 208, 214, 220]  # mirror reading (input) — warm
 _COOLH = [17, 18, 24, 31, 38, 44, 45, 51]  # mirror writing (output) — cool
-# DEFAULT full-scale rates (tokens/sec) — the cold-start fallback used only by the
-# very first session on a machine (later sessions seed from an existing session's
-# scale; see _seed_scale). The live scale comes from _full_scales() (90% above your
-# true average non-cache rate), so revline fits YOUR usage within a few minutes. These
-# are just sane starting points for non-cache throughput until real data arrives.
+# DEFAULT full-scale RATES (tokens/sec) — the cold-start fallback for a row that hasn't
+# yet seen _SCALE_MIN_N active buckets of history. _full_scales() scales these by a
+# row's slot to get a default AMOUNT, then replaces them with the machine's own
+# percentile once enough data accrues. Just sane non-cache starting points.
 _FULL_READ_DEFAULT = 800
 _FULL_WRITE_DEFAULT = 120
 # tps needle responsiveness: the EMA halflife in seconds — how fast old activity fades
@@ -525,9 +568,9 @@ def mirror_tach(read_rate, write_rate, full_read, full_write):
     quiets, so the needle slides both ways on the machine's calibrated scale."""
 
     def fill(rate, full):
-        return round(
-            min(1.0, max(0.0, rate) / full) * HALF
-        )  # linear vs calibrated peak
+        if not full:  # guard a degenerate 0 scale — never divide-by-zero the footer
+            return 0
+        return round(min(1.0, max(0.0, rate) / full) * HALF)  # linear vs peak
 
     lf, wf = fill(read_rate, full_read), fill(write_rate, full_write)
     left = [
@@ -600,6 +643,8 @@ def git_state(cwd, sid):
 
     g = {k: 0 for k in keys}
     g["repo"] = g["branch"] = g["url"] = ""
+
+    import subprocess  # lazy: only reached on a git cache-miss (see the top-of-file note)
 
     stalled = []  # set once any git call times out — see below
 
@@ -786,6 +831,10 @@ def _render(d):
     thinking = obj(d.get("thinking")).get("enabled")
     cwd = obj(d.get("workspace")).get("current_dir") or d.get("cwd") or ""
     sid = d.get("session_id") or "nosession"
+    if not re.fullmatch(
+        r"[A-Za-z0-9._-]{4,}", sid
+    ):  # keep it path-safe (it names files)
+        sid = "nosession"
     name = d.get("session_name")  # set via /rename or --name; absent when unnamed
 
     ctx = obj(d.get("context_window"))
@@ -1012,16 +1061,18 @@ def _render(d):
         )
 
     # the mirror: 'tps' is the live tokens-per-second needle split read|write (a
-    # RATE — "how fast right now", not a time bucket); the rows below are the timeline
-    # history — reading (warm) left, writing (cool) right, newest at center. ONE
-    # calibrated peak (90% above your average) scales every row and the needle.
-    full_read, full_write = _full_scales(sid)
+    # RATE — "how fast right now"); the rows below are the timeline history — reading
+    # (warm) left, writing (cool) right, newest at center. Each row uses ITS OWN frozen
+    # per-machine reference (a busy-bucket amount for that timescale); the tps needle
+    # uses the span=1 per-second reference (a busy second's tokens).
+    scales = _full_scales()
+    tps_r, tps_w = scales[1]  # per-second full-scale for the live needle
     read_r = ema_rate(rows, cnow, IN, _TACH_HALFLIFE)  # responsiveness knob (secs)
     write_r = ema_rate(rows, cnow, OUT, _TACH_HALFLIFE)
     sec_gauge.append(
         grow(
             "tps",
-            mirror_tach(read_r, write_r, full_read, full_write),
+            mirror_tach(read_r, write_r, tps_r, tps_w),
             ktok(round(read_r)),
             ktok(round(write_r)),
         )
@@ -1036,13 +1087,9 @@ def _render(d):
         src = day_rows if span > 3600 else rows
         i = max(0, cur_in - _cum_at(src, cnow - span, IN))
         o = max(0, cur_out - _cum_at(src, cnow - span, OUT))
+        fr, fw = scales[span]
         sec_gauge.append(
-            grow(
-                lab,
-                mirror_hist(src, cnow, span, full_read, full_write),
-                ktok(i),
-                ktok(o),
-            )
+            grow(lab, mirror_hist(src, cnow, span, fr, fw), ktok(i), ktok(o))
         )
 
     # ═══ Usage — rate-limit budgets as bars ═══════════════════
@@ -1074,15 +1121,19 @@ def _render(d):
 
 
 def _cleanup_session(sid):
-    """Remove ALL of a session's per-session state — meant to run on SessionEnd so a
-    closed session leaves nothing behind (the hourly GC is the backstop for crashes /
-    hard kills where the hook never fires). Drops its calibration log + scale (beside
-    the script) and its token stores + git cache (in TMP). The sid is a UUID, so the
-    globs can't touch another session's files."""
-    if not sid:
+    """Remove a session's per-session state (its token stores + git cache in TMP) on
+    SessionEnd, so a closed session leaves nothing behind (the hourly GC is the backstop
+    for crashes where the hook never fires). Does NOT touch the machine-level
+    token_rates.log — that's shared calibration memory that outlives any one session.
+    The sid is VALIDATED to a safe charset and glob-escaped before use: a wildcard in
+    sid must never let one session's cleanup wipe every session's files."""
+    if not sid or not re.fullmatch(r"[A-Za-z0-9._-]{4,}", sid):
         return
-    targets = glob.glob(os.path.join(_here(), f"token_rates-{sid}.*"))
-    targets += glob.glob(os.path.join(TMP, f"cc-statusline-*{sid}*"))
+    esc = glob.escape(sid)
+    targets = glob.glob(os.path.join(TMP, f"cc-statusline-*{esc}*"))
+    targets += glob.glob(
+        os.path.join(_here(), f"token_rates-{esc}.*")
+    )  # legacy, if any
     for f in targets:
         try:
             os.remove(f)
@@ -1129,10 +1180,12 @@ def main():
         print(_set_layout("vertical"))
         return
     if verb == "cleanup":
-        # SessionEnd hook (or `revline cleanup <sid>`): drop this session's files.
-        # sid comes from argv, else from the session JSON the hook pipes on stdin.
-        sid = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not sid and not sys.stdin.isatty():
+        # `revline cleanup <sid>` (explicit sid) OR a SessionEnd hook (sid + reason
+        # piped as JSON on stdin). An EXPLICIT argv sid is authoritative — we do NOT
+        # fall through to stdin then (even if it's empty), or `cleanup ""` would block
+        # forever on json.load. Only read stdin when NO argv sid was given.
+        sid = sys.argv[2] if len(sys.argv) > 2 else None
+        if sid is None and not sys.stdin.isatty():
             try:
                 j = obj(json.load(sys.stdin))
                 # SessionEnd also fires on /clear and resume, but those KEEP the session
@@ -1142,7 +1195,7 @@ def main():
                 sid = j.get("session_id", "")
             except Exception:
                 sid = ""
-        _cleanup_session(sid)
+        _cleanup_session(sid or "")
         return
     if verb in ("help", "usage") or sys.stdin.isatty():
         # `revline help`, a bare `revline`, OR a mistyped verb in a terminal — any

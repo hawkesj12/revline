@@ -100,7 +100,7 @@ def test_lifecycle_and_noncache():
     render(sid, 500_000, 1500, 300, 40)
     render(sid, 500_000, 1500, 300, 900)  # same turn streaming output
     row = store_row(sid)
-    check("store + log created on activity", bool(files_for(sid)) and row is not None)
+    check("store created on activity", bool(files_for(sid)) and row is not None)
     check(
         "reading counts NON-CACHE (1500+300=1800), not the 500k total",
         row is not None and row[1] == 1800,
@@ -130,13 +130,16 @@ def test_two_concurrent_sessions_isolated():
         ra is not None and rb is not None and ra[1] == 9000 and rb[1] == 1800,
     )
     check(
-        "each session has its OWN calibration log",
-        os.path.exists(os.path.join(HERE, f"token_rates-{a}.log"))
-        and os.path.exists(os.path.join(HERE, f"token_rates-{b}.log")),
+        "one shared machine-level calibration log (not per-session)",
+        os.path.exists(os.path.join(HERE, "token_rates.log")),
     )
     session_end(a, "other")
     check("closing A removed A's files", not files_for(a))
     check("B's files untouched by A's close", bool(files_for(b)))
+    check(
+        "cleanup did NOT delete the shared machine log",
+        os.path.exists(os.path.join(HERE, "token_rates.log")),
+    )
     wipe(a, b)
 
 
@@ -222,15 +225,62 @@ def test_never_crashes():
     wipe("revtest-x")
 
 
+def test_cleanup_cannot_over_delete():
+    print("\n[7] cleanup rejects wildcard/empty sids (can't wipe other sessions)")
+    victim = "revtest-victim"
+    for bad in ("*", "?", "", "a"):  # metachar / empty / too-short must be no-ops
+        wipe(victim)
+        render(victim, 200_000, 1500, 0, 50)
+        before = bool(files_for(victim))
+        subprocess.run(
+            ["python3", "revline.py", "cleanup", bad],
+            text=True,
+            capture_output=True,
+            cwd=HERE,
+        )
+        kept = bool(files_for(victim))
+        check(
+            f"cleanup {bad!r} left an unrelated session's files intact", before and kept
+        )
+    wipe(victim)
+    render(victim, 200_000, 1500, 0, 50)
+    subprocess.run(
+        ["python3", "revline.py", "cleanup", victim],
+        text=True,
+        capture_output=True,
+        cwd=HERE,
+    )
+    check("cleanup <valid-sid> still removes that session", not files_for(victim))
+    wipe(victim)
+
+
 if __name__ == "__main__":
-    print("═══ revline end-to-end tests ═══")
-    test_lifecycle_and_noncache()
-    test_two_concurrent_sessions_isolated()
-    test_cleanup_reasons()
-    test_store_versioning()
-    test_window_nesting()
-    test_never_crashes()
-    print(f"\n═══ {len(PASS)} passed, {len(FAIL)} failed ═══")
+    # Isolate the shared machine log/scale so the test's synthetic activity never
+    # pollutes real calibration data — back up, run, restore.
+    _saved = {}
+    for _name in ("token_rates.log", "token_rates.scale"):
+        _p = os.path.join(HERE, _name)
+        if os.path.exists(_p):
+            _saved[_p] = open(_p, "rb").read()
+    try:
+        print("═══ revline end-to-end tests ═══")
+        test_lifecycle_and_noncache()
+        test_two_concurrent_sessions_isolated()
+        test_cleanup_reasons()
+        test_store_versioning()
+        test_window_nesting()
+        test_never_crashes()
+        test_cleanup_cannot_over_delete()
+        print(f"\n═══ {len(PASS)} passed, {len(FAIL)} failed ═══")
+    finally:
+        for _p in (
+            os.path.join(HERE, "token_rates.log"),
+            os.path.join(HERE, "token_rates.scale"),
+        ):
+            if _p in _saved:
+                open(_p, "wb").write(_saved[_p])  # restore original
+            elif os.path.exists(_p):
+                os.remove(_p)  # created by the test → remove
     if FAIL:
         for f in FAIL:
             print(f"  ✗ {f}")

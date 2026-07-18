@@ -103,14 +103,15 @@ def gauges(all_rows, now):
         + " " * (_RN + 1 + 1 + _cw + 1 + 1 - len("reading"))
         + f"\033[38;5;45mwriting{R}"
     )
-    full_read, full_write = rl._full_scales("demo")
+    scales = rl._full_scales()
+    tps_r, tps_w = scales[1]  # per-second full-scale for the live needle
     read_r = rl.ema_rate(rows, now, rl.IN, rl._TACH_HALFLIFE)
     write_r = rl.ema_rate(rows, now, rl.OUT, rl._TACH_HALFLIFE)
     lines = [
         header,
         grow(
             "tps",
-            rl.mirror_tach(read_r, write_r, full_read, full_write),
+            rl.mirror_tach(read_r, write_r, tps_r, tps_w),
             rl.ktok(round(read_r)),
             rl.ktok(round(write_r)),
         ),
@@ -119,10 +120,11 @@ def gauges(all_rows, now):
         src = day_rows if span > 3600 else rows
         i = max(0, rl._cum_at(src, now, rl.IN) - rl._cum_at(src, now - span, rl.IN))
         o = max(0, rl._cum_at(src, now, rl.OUT) - rl._cum_at(src, now - span, rl.OUT))
+        fr, fw = scales[span]
         lines.append(
             grow(
                 lab,
-                rl.mirror_hist(src, now, span, full_read, full_write),
+                rl.mirror_hist(src, now, span, fr, fw),
                 rl.ktok(i),
                 rl.ktok(o),
             )
