@@ -125,6 +125,8 @@ Developed and used on macOS. It uses only portable standard-library calls (resol
 
 Issues and PRs welcome — open an issue first to talk it through. It's one file by design; the goal is to keep it self-contained and dependency-free.
 
+Run the tests before opening a PR: `python3 test_revline.py`.
+
 ## License
 
 [MIT](LICENSE) © 2026 Justin Hawkes
