@@ -52,22 +52,29 @@
 # Runs locally, reads Claude Code's status JSON on stdin, prints text.
 # It costs ZERO API tokens — the status line is never sent to the model.
 # ═══════════════════════════════════════════════════════════════
-import glob
 import json
 import os
 import re
 import sys
-import tempfile
 import time
 
-# `subprocess` is imported lazily inside git_state() — it's only needed on a git
-# cache-miss (~1 render in 12), and importing it costs ~5 ms on EVERY warm render.
-import unicodedata
+# The status line spawns a FRESH process every render (~1/sec), so every top-level
+# import is paid on EVERY render. `subprocess` (git, ~1 render in 12), `glob` (only
+# throttled/cold paths), and `unicodedata` (horizontal layout only) are therefore
+# imported LAZILY inside the functions that need them — `subprocess`/`tempfile` alone
+# cost ~5 ms each at module load (tempfile drags in random/shutil/bz2/lzma to call
+# gettempdir() once), and none is needed on the common warm render.
 
-# Per-session state files live here. tempfile.gettempdir() (not a hardcoded
-# /tmp) so the git cache + token gauges also work on Windows. Basenames stay
-# "cc-statusline-*" so _gc's glob still matches existing files.
-TMP = tempfile.gettempdir()
+# Per-session state files live here. Resolved from the standard temp-dir env vars
+# (the same ones tempfile.gettempdir() consults) so the git cache + token gauges also
+# work on Windows (TEMP/TMP are set there) — without importing tempfile. Basenames
+# stay "cc-statusline-*" so _gc's glob still matches existing files.
+TMP = (
+    os.environ.get("TMPDIR")
+    or os.environ.get("TEMP")
+    or os.environ.get("TMP")
+    or "/tmp"
+).rstrip("/")
 # Token-store schema version. BUMP THIS whenever the meaning of what's stored changes
 # (e.g. reading switched from total-input to non-cache), so every session abandons its
 # now-invalid old store and re-accumulates from scratch instead of carrying a stale
@@ -212,6 +219,8 @@ def _gc():
         now = time.time()
         if os.path.exists(marker) and now - os.path.getmtime(marker) < 3600:
             return
+        import glob  # only reached past the hourly throttle — keep it off warm renders
+
         _atomic_write(marker, str(int(now)))
         for f in glob.glob(os.path.join(TMP, "cc-statusline-*")):
             try:
@@ -293,12 +302,16 @@ def _log_rate(t, read, write):
 
 
 def _pctl(sorted_vals, p):
-    """p-th percentile of a pre-sorted list (nearest-rank, clamped). 0.0 when empty."""
-    if not sorted_vals:
+    """p-th percentile of a pre-sorted list by the NEAREST-RANK method: rank =
+    ceil(p/100 · n), returning the value at that 1-based rank (index rank−1). Uses
+    integer ceil (−(−a // b)) to avoid a math import. The old int(p/100·n) was a floor
+    index, biased ~1 rank high. Clamped to the ends; 0.0 when empty. (At small n a high
+    percentile legitimately resolves to the max — that's the estimator, not a bug.)"""
+    n = len(sorted_vals)
+    if not n:
         return 0.0
-    return float(
-        sorted_vals[min(len(sorted_vals) - 1, int(p / 100 * len(sorted_vals)))]
-    )
+    idx = -(-(int(p) * n) // 100) - 1  # ceil(p·n/100) − 1, as a 0-based index
+    return float(sorted_vals[max(0, min(n - 1, idx))])
 
 
 def _full_scales():
@@ -320,6 +333,8 @@ def _full_scales():
             return {int(k): tuple(v) for k, v in d.items()}
     except Exception:
         pass
+
+    import glob  # only reached on a cold recompute (TTL miss), not the warm cache hit
 
     # default per-row full = the per-second default scaled to that bucket's width
     out = {
@@ -433,7 +448,18 @@ def record_tokens(sid, in_raw, out_raw, size=None):
         in_cum += read_add
         out_cum += write_add
         fine.append((now, in_cum, out_cum, in_raw, out_raw))
-        fine = [r for r in fine if r[0] >= now - 3660]
+        # Prune to the last ~61 min, but ALWAYS retain the newest dropped row as a
+        # baseline ANCHOR. After a long idle gap every pre-idle row ages out at once,
+        # leaving only post-idle rows that carry the lifetime cumulative — then
+        # _cum_at() finds no row before a window's start, the baseline falls to 0, and
+        # the 1m/10m gauge reads the WHOLE session's tokens (and can exceed the 4h row).
+        # One carried-forward anchor keeps the window math floored to real recent work.
+        cutoff = now - 3660
+        kept = [r for r in fine if r[0] >= cutoff]
+        dropped = [r for r in fine if r[0] < cutoff]
+        if dropped and kept[0][0] > cutoff:
+            kept = [dropped[-1]] + kept
+        fine = kept
         _log_rate(now, read_add, write_add)  # machine-level calibration history
         _write_store(fpath, fine)
     day = [r for r in _read_store(dpath) if len(r) >= 5]
@@ -713,9 +739,13 @@ _OSC8 = re.compile(r"\033\]8;;[^\033]*\033\\")  # OSC-8 hyperlink open+close wra
 
 
 def _here():
-    """The directory holding this script — resolving symlinks, so the config
-    file is found next to the REAL file even when run via a PATH symlink."""
-    return os.path.dirname(os.path.realpath(__file__))
+    """The directory holding this script — resolving symlinks, so the config file and
+    per-machine calibration log are found next to the REAL file even when run via a PATH
+    symlink. REVLINE_STATE_DIR overrides it: the test suite points it at a temp dir so
+    tests never touch (or clobber) the live token_rates.log the real statusline shares."""
+    return os.environ.get("REVLINE_STATE_DIR") or os.path.dirname(
+        os.path.realpath(__file__)
+    )
 
 
 def _config_path():
@@ -778,6 +808,8 @@ def _vis_width(s):
     then count East-Asian-wide (CJK) glyphs as 2 cells and combining marks as 0.
     This is what lets the horizontal layout align two columns. (revline avoids
     emoji in aligned rows — terminals disagree on their width by a cell.)"""
+    import unicodedata  # horizontal layout only — off the default vertical render
+
     s = _OSC8.sub("", _ANSI_SGR.sub("", s))
     w = 0
     for ch in s:
@@ -1129,6 +1161,8 @@ def _cleanup_session(sid):
     sid must never let one session's cleanup wipe every session's files."""
     if not sid or not re.fullmatch(r"[A-Za-z0-9._-]{4,}", sid):
         return
+    import glob  # SessionEnd-only path — not imported on a normal render
+
     esc = glob.escape(sid)
     targets = glob.glob(os.path.join(TMP, f"cc-statusline-*{esc}*"))
     targets += glob.glob(

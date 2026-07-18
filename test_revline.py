@@ -11,20 +11,40 @@
 # cleanup lifecycle (delete on exit, keep on /clear + resume), and never-crash.
 # All artifacts use "revtest-*" ids and are removed at the end.
 # ═══════════════════════════════════════════════════════════════
+import atexit
 import glob
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 TMP = tempfile.gettempdir()
+
+# Redirect revline's script-relative state (the SHARED per-machine token_rates.log /
+# .scale) to a throwaway dir for the whole test run, via REVLINE_STATE_DIR. Set in the
+# process env BEFORE any render, so every revline subprocess inherits it — the tests
+# never read, write, or clobber the live calibration log the real statusline shares.
+# Works identically under `pytest` and `python3 test_revline.py` (no __main__-only
+# guard, which was the old isolation's bug). Per-session stores stay in TMP under
+# unique revtest-* ids, so they need no redirect. STATE_DIR is removed at the end.
+STATE_DIR = os.path.join(TMP, "revtest-state")
+os.makedirs(STATE_DIR, exist_ok=True)
+os.environ["REVLINE_STATE_DIR"] = STATE_DIR
+# atexit fires under BOTH `pytest` and `python3 test_revline.py`, so the throwaway
+# state dir is always removed regardless of entry point.
+atexit.register(lambda: shutil.rmtree(STATE_DIR, ignore_errors=True))
+
 PASS, FAIL = [], []
 
 
 def check(name, cond):
     (PASS if cond else FAIL).append(name)
     print(f"  {'✓' if cond else '✗ FAIL'}  {name}")
+    # Assert, so `pytest` actually FAILS on a bad check. The old check() only appended
+    # to a list, so pytest stayed green even when internal checks failed (a blind gate).
+    assert cond, name
 
 
 def render(sid, total_in, fresh_in, cache_creation, out, cwd="/tmp"):
@@ -69,7 +89,7 @@ def session_end(sid, reason="other"):
 
 def files_for(sid):
     return glob.glob(os.path.join(TMP, f"cc-statusline-*{sid}*")) + glob.glob(
-        os.path.join(HERE, f"token_rates-{sid}.*")
+        os.path.join(STATE_DIR, f"token_rates-{sid}.*")
     )
 
 
@@ -131,14 +151,14 @@ def test_two_concurrent_sessions_isolated():
     )
     check(
         "one shared machine-level calibration log (not per-session)",
-        os.path.exists(os.path.join(HERE, "token_rates.log")),
+        os.path.exists(os.path.join(STATE_DIR, "token_rates.log")),
     )
     session_end(a, "other")
     check("closing A removed A's files", not files_for(a))
     check("B's files untouched by A's close", bool(files_for(b)))
     check(
         "cleanup did NOT delete the shared machine log",
-        os.path.exists(os.path.join(HERE, "token_rates.log")),
+        os.path.exists(os.path.join(STATE_DIR, "token_rates.log")),
     )
     wipe(a, b)
 
@@ -255,32 +275,25 @@ def test_cleanup_cannot_over_delete():
 
 
 if __name__ == "__main__":
-    # Isolate the shared machine log/scale so the test's synthetic activity never
-    # pollutes real calibration data — back up, run, restore.
-    _saved = {}
-    for _name in ("token_rates.log", "token_rates.scale"):
-        _p = os.path.join(HERE, _name)
-        if os.path.exists(_p):
-            _saved[_p] = open(_p, "rb").read()
-    try:
-        print("═══ revline end-to-end tests ═══")
-        test_lifecycle_and_noncache()
-        test_two_concurrent_sessions_isolated()
-        test_cleanup_reasons()
-        test_store_versioning()
-        test_window_nesting()
-        test_never_crashes()
-        test_cleanup_cannot_over_delete()
-        print(f"\n═══ {len(PASS)} passed, {len(FAIL)} failed ═══")
-    finally:
-        for _p in (
-            os.path.join(HERE, "token_rates.log"),
-            os.path.join(HERE, "token_rates.scale"),
-        ):
-            if _p in _saved:
-                open(_p, "wb").write(_saved[_p])  # restore original
-            elif os.path.exists(_p):
-                os.remove(_p)  # created by the test → remove
+    # Isolation is handled by REVLINE_STATE_DIR (set at import); cleanup by atexit — so
+    # the real calibration log is never touched and there's nothing to back up/restore.
+    # Run every test even if one fails (check() now raises, so catch per-test) to print
+    # a full summary.
+    print("═══ revline end-to-end tests ═══")
+    for _t in (
+        test_lifecycle_and_noncache,
+        test_two_concurrent_sessions_isolated,
+        test_cleanup_reasons,
+        test_store_versioning,
+        test_window_nesting,
+        test_never_crashes,
+        test_cleanup_cannot_over_delete,
+    ):
+        try:
+            _t()
+        except AssertionError:
+            pass  # already recorded in FAIL + printed by check()
+    print(f"\n═══ {len(PASS)} passed, {len(FAIL)} failed ═══")
     if FAIL:
         for f in FAIL:
             print(f"  ✗ {f}")
