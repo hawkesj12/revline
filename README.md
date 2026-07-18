@@ -15,7 +15,7 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 - **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets).
 - **The read/write "mirror"** — a butterfly chart of tokens **read** (non-cache input, warm) vs **written** (output, cool) over time. Reading fills the left half from the center outward; writing fills the right. Newest is at the center, oldest at the outer edges, with the read and write totals flanking each row.
 - **Five timescales** — `tps` is a live, EMA-smoothed tokens-per-second needle (how fast right now); `1m / 10m / 4h / 1d` are the timeline. Both bar height and hue rise with throughput.
-- **Self-calibrating scale** — instead of a hardcoded peak, revline sets the bars' full-scale from _your own_ recent usage: 90% above your true average token rate (total tokens ÷ elapsed time, so idle counts too). One peak scales the whole mirror, linearly, so a response streams in at the center of each row just like the needle and nothing strobes as the window slides. Calibration is **per session** — each session learns from its own small, self-pruning, gitignored `token_rates-<id>.log` (a new session seeds from a recent one so it's never cold).
+- **Self-calibrating, per-timescale scale** — instead of a hardcoded peak, each row sets its own "full bar" from _your machine's_ real history: a robust high percentile of how many tokens a bucket of that row's width actually holds when it's active. A 5-second slice and a 2-hour slice hold wildly different amounts, so each timescale is scaled independently — a typical bucket lands mid-bar and only your busiest ones peg. The references are pooled across all your sessions into one small, self-pruning, gitignored `token_rates.log` (more history → a steadier scale) and **frozen** between refreshes, so a given amount always maps to the same height — no render-to-render strobing — and buckets are grid-anchored so a row steps one whole slice at a time as time passes.
 - **Two layouts, toggled live** — `vertical` (stacked) or `horizontal` (two aligned columns), switched with `revline flip` without restarting.
 - **Clickable git links** — repo and PR are OSC-8 hyperlinks in terminals that support them.
 - **Never crashes your footer** — any malformed input prints nothing and exits cleanly, rather than leaking a traceback.
@@ -119,7 +119,7 @@ This is a **throughput / activity** view, not a billing figure. For spend, watch
 
 ## Platform notes
 
-Developed and used on macOS. It uses only portable standard-library calls (`tempfile.gettempdir()` for its small state files, no POSIX-only APIs), so it should run on Linux and Windows as well — but Windows hasn't been verified yet. Reports welcome.
+Developed and used on macOS. It uses only portable standard-library calls (resolving the temp dir from the standard `TMPDIR` / `TEMP` / `TMP` environment variables for its small state files, no POSIX-only APIs), so it should run on Linux and Windows as well — but Windows hasn't been verified yet. Reports welcome.
 
 ## Contributing
 
