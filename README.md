@@ -23,7 +23,7 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 
 ## Requirements
 
-- **Python 3** (standard library only — no third-party packages).
+- **Python 3.10+** (standard library only — no third-party packages). CI runs the test suite on Linux and Windows, on 3.10 and 3.13.
 - A terminal with 256-color / truecolor support (most modern terminals: iTerm2, WezTerm, VS Code, the JetBrains terminal, Windows Terminal). OSC-8 links are an optional nicety that degrades gracefully where unsupported.
 
 ## Install
@@ -119,13 +119,28 @@ This is a **throughput / activity** view, not a billing figure. For spend, watch
 
 ## Platform notes
 
-Developed and used on macOS. It uses only portable standard-library calls (resolving the temp dir from the standard `TMPDIR` / `TEMP` / `TMP` environment variables for its small state files, no POSIX-only APIs), so it should run on Linux and Windows as well — but Windows hasn't been verified yet. Reports welcome.
+Developed and used on macOS. It uses only portable standard-library calls (resolving the temp dir from the standard `TMPDIR` / `TEMP` / `TMP` environment variables for its small state files, no POSIX-only APIs). Linux and Windows are covered by CI on every push.
+
+**On text encoding.** Claude Code reads the status line through a pipe, and before Python 3.15 ([PEP 686](https://peps.python.org/pep-0686/)) Windows picks a pipe's encoding from the locale — historically cp1252, which cannot represent the block characters the mirror is drawn with. Left alone, that blanks the footer silently.
+
+revline handles it by asking who is reading:
+
+- **The status line** has exactly one reader — Claude Code, over a pipe, which takes UTF-8 — so revline pins its output to UTF-8 regardless of what the locale defaulted to. You get the real chart on every platform.
+- **The terminal commands** (`revline help`, `revline flip`, …) print wherever _you_ pointed them, so there a `PYTHONIOENCODING` you set is honoured. If it can't carry the block characters, the chart degrades to an ASCII ramp that still charts — `[_.:-=+*#|#*+=-:._]` — rather than to question marks.
+
+Input is pinned to UTF-8 too, so a project path, branch, or model name with non-ASCII characters arrives intact instead of mangling the Git section.
 
 ## Contributing
 
 Issues and PRs welcome — open an issue first to talk it through. It's one file by design; the goal is to keep it self-contained and dependency-free.
 
-Run the tests before opening a PR: `python3 test_revline.py`.
+Run the tests before opening a PR: `python3 test_revline.py` (~2s). Run it
+directly rather than under `pytest` — pytest collects only the 10 `def test_` functions
+and reports "10 passed", which is true but hides most of the assertions.
+
+Optional, and recommended if you're editing `revline.py` in place: `git config core.hooksPath hooks`
+installs a pre-commit gate that renders the status line, runs the suite, and lints before
+letting a commit through.
 
 ## License
 
