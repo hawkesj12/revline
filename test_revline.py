@@ -41,6 +41,24 @@ import tempfile
 HERE = os.path.dirname(os.path.realpath(__file__))
 TMP = tempfile.gettempdir()
 
+# The harness prints ═, ✓ and ✗, which cp1252 cannot encode — so on a Windows runner
+# this file died on its own banner before running a single check, with the same
+# UnicodeEncodeError it exists to catch. (Confirmed on real Windows, not simulated:
+# the first CI run failed here on both 3.10 and 3.13 while Linux passed.)
+#
+# This does NOT weaken what is under test. Every assertion below reads the raw BYTES a
+# subprocess wrote, with that subprocess's own encoding pinned explicitly via env — so
+# the harness's stdout is independent of the thing being measured.
+#
+# The harness's own subprocess.run(text=True) calls carry encoding="utf-8" for the same
+# reason: text mode decodes with the LOCALE encoding, so under LC_ALL=C they choked on
+# revline's UTF-8 output. Third instance of the identical bug class, and the one the
+# PEP 597 detector in [9] cannot see — it scans revline.py, not this file.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Redirect revline's script-relative state (the SHARED per-machine token_rates.log /
 # .scale) to a throwaway dir for the whole test run, via REVLINE_STATE_DIR. Set in the
 # process env BEFORE any render, so every revline subprocess inherits it — the tests
@@ -94,6 +112,7 @@ def render(sid, total_in, fresh_in, cache_creation, out, cwd="/tmp"):
         [sys.executable, "revline.py"],
         input=payload,
         text=True,
+        encoding="utf-8",
         capture_output=True,
         cwd=HERE,
     )
@@ -105,6 +124,7 @@ def session_end(sid, reason="other"):
         [sys.executable, "revline.py", "cleanup"],
         input=json.dumps({"session_id": sid, "reason": reason}),
         text=True,
+        encoding="utf-8",
         capture_output=True,
         cwd=HERE,
     )
@@ -261,6 +281,7 @@ def test_never_crashes():
             [sys.executable, "revline.py"],
             input=payload,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             cwd=HERE,
         )
@@ -278,6 +299,7 @@ def test_cleanup_cannot_over_delete():
         subprocess.run(
             [sys.executable, "revline.py", "cleanup", bad],
             text=True,
+            encoding="utf-8",
             capture_output=True,
             cwd=HERE,
         )
@@ -290,6 +312,7 @@ def test_cleanup_cannot_over_delete():
     subprocess.run(
         [sys.executable, "revline.py", "cleanup", victim],
         text=True,
+        encoding="utf-8",
         capture_output=True,
         cwd=HERE,
     )
@@ -574,6 +597,7 @@ def test_no_implicit_locale_encoding():
             ],
             input=json.dumps(payload),
             text=True,
+            encoding="utf-8",
             capture_output=True,
             cwd=HERE,
         )
@@ -621,6 +645,7 @@ def test_crossplatform_state_paths():
         [sys.executable, "-c", "import revline; print(revline.TMP)"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=HERE,
         env=env,
     )
