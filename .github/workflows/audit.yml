@@ -1,0 +1,40 @@
+name: Audit
+
+# Weekly, not on push. These checks find problems that appear WITHOUT this repo
+# changing — a link that rotted upstream, an action tag repointed by its owner, a
+# CVE published against something you pinned. Nothing commit-triggered can catch
+# those; there is no commit to trigger on. A failure emails you.
+#
+# The checks themselves live in hawkesj12/workflows so every repo shares one copy.
+#
+# ⚠ revline is PUBLIC and finished-ish, which is exactly the profile GitHub's
+# 60-day rule bites: scheduled workflows are auto-disabled in a public repo after
+# 60 days with no repository activity. If this sits untouched for two months the
+# audit stops silently. Check the Actions tab if it has been quiet a while.
+
+on:
+  schedule:
+    - cron: "0 13 * * 1" # Mondays 09:00 ET (cron is UTC; 13:00 UTC = 09:00 EDT)
+  workflow_dispatch: # run it by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    uses: hawkesj12/workflows/.github/workflows/audit.yml@31301b02c63e34963bdbaf3b48529682a69f2714 # v1.2.5
+    permissions:
+      # The UNION of what every called job declares. Permissions only narrow down a
+      # reusable-workflow chain, so granting less than the callee asks for is a
+      # startup_failure with no jobs, no log, and no annotation.
+      contents: read
+      id-token: write # Scorecard — required even when scorecard: false
+    with:
+      docs: "README.md"
+      scorecard: true # revline is public, so Scorecard can publish
+      # revline imports 8 stdlib modules and nothing else — verified, zero
+      # third-party. So there is no lockfile and nothing for a CVE scan to read.
+      # Declared rather than left to a silent pass: the CVE job SKIPS, which reads
+      # as skipped instead of as "no CVEs found". Delete this line the day revline
+      # grows a dependency.
+      deps: none
