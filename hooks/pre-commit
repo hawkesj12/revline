@@ -16,8 +16,29 @@
 # Deliberately fast (~2s). A gate people disable for being slow gates nothing.
 set -e
 
+# ── check the INDEX, not the working tree ───────────────────────────────────────
+# The version of this hook that tested the working tree was unreliable in BOTH
+# directions, and it was demonstrated, not theorised: staging a broken revline.py while
+# the file on disk was fine produced "revline pre-commit: ok" and committed the broken
+# code. The mirror case is just as bad — an unstaged experiment blocks a commit that
+# does not contain it.
+#
+# So export exactly what is being committed to a temp tree and run the checks there.
+# `git stash --keep-index` is the other common recipe and is WRONG here: it mutates the
+# working tree, which is live production through the symlink, and a conflict on pop
+# would leave that tree in a broken state.
+tmp=$(mktemp -d 2>/dev/null || mktemp -d -t revline-precommit)
+trap 'rm -rf "$tmp"' EXIT INT TERM HUP   # survives an interrupt, unlike an rm at the end
+
 repo=$(git rev-parse --show-toplevel)
 cd "$repo"
+git checkout-index --all --force --prefix="$tmp/"
+
+# Nothing staged (e.g. `git commit --amend` with no changes) — nothing to check.
+if [ ! -f "$tmp/revline.py" ]; then
+  echo "revline pre-commit: no revline.py in the index - skipping checks."
+  exit 0
+fi
 
 # Windows ships `python.exe` and no `python3` (CPython's installer creates versioned
 # names, not a python3 alias), so a hard-coded python3 would block every commit for a
@@ -25,33 +46,38 @@ cd "$repo"
 if command -v python3 >/dev/null 2>&1; then PY=python3
 elif command -v python  >/dev/null 2>&1; then PY=python
 else
-  echo "revline pre-commit: no python3 or python on PATH — skipping checks."
+  echo "revline pre-commit: no python3 or python on PATH - skipping checks."
   exit 0   # a missing interpreter is not a reason to block a commit
 fi
 
+cd "$tmp"
 printf 'revline pre-commit: '
+
+# ASCII only from here down. This project exists because a Unicode glyph could not be
+# encoded on a Windows console; a hook that printed one would be an embarrassing way to
+# fail, and it would fail while REPORTING an error, which is the worst possible moment.
 
 # 1. Does it still render? The cheapest possible check and the one that maps directly
 #    to "is my footer about to go blank". Empty JSON is the degenerate payload.
 printf 'render '
 if ! echo '{}' | "$PY" revline.py >/dev/null 2>&1; then
   echo ""
-  echo "  ✗ revline.py failed to render — your status line is broken RIGHT NOW."
-  echo "    Reproduce with:  echo '{}' | $PY revline.py"
+  echo "  FAIL: revline.py failed to render - the staged version is broken."
+  echo "  Reproduce:  git show :revline.py > /tmp/r.py && echo '{}' | $PY /tmp/r.py"
   exit 1
 fi
 
 # 2. The suite. Includes the encoding tests, which are the ones that catch a Windows
 #    regression you structurally cannot see on this machine.
-printf 'tests '
-if ! "$PY" test_revline.py >/tmp/revline-precommit.$$ 2>&1; then
-  echo ""
-  echo "  ✗ tests failed:"
-  tail -20 /tmp/revline-precommit.$$
-  rm -f /tmp/revline-precommit.$$
-  exit 1
+if [ -f test_revline.py ]; then
+  printf 'tests '
+  if ! "$PY" test_revline.py </dev/null >"$tmp/.out" 2>&1; then
+    echo ""
+    echo "  FAIL: tests"
+    tail -20 "$tmp/.out"
+    exit 1
+  fi
 fi
-rm -f /tmp/revline-precommit.$$
 
 # 3. Lint + format, but only if ruff is present — this hook must not become a reason
 #    to install something before you can commit.
@@ -59,12 +85,12 @@ if command -v ruff >/dev/null 2>&1; then
   printf 'lint '
   if ! ruff check . >/dev/null 2>&1; then
     echo ""
-    echo "  ✗ ruff check failed — run: ruff check ."
+    echo "  FAIL: ruff check - run: ruff check ."
     exit 1
   fi
   if ! ruff format --check . >/dev/null 2>&1; then
     echo ""
-    echo "  ✗ formatting — run: ruff format ."
+    echo "  FAIL: formatting - run: ruff format ."
     exit 1
   fi
 fi

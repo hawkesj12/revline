@@ -147,7 +147,9 @@ and reports "10 passed", which is true but hides most of the assertions.
 
 Optional, and recommended if you're editing `revline.py` in place: `git config core.hooksPath hooks`
 installs a pre-commit gate that renders the status line, runs the suite, and lints before
-letting a commit through.
+letting a commit through. It checks the **staged** content — exported to a temp tree — not
+your working directory, so an unstaged experiment can't block an unrelated commit and a
+broken staged file can't slip past a clean working tree.
 
 ## License
 
