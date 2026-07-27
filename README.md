@@ -135,7 +135,7 @@ Input is pinned to UTF-8 too, so a project path, branch, or model name with non-
 
 revline installs by copying a file, so there's no package manager to ask what you're running. `revline version` (or the first line of `revline help`) tells you — quote it if you open an issue.
 
-Releases are [tagged](https://github.com/hawkesj12/revline/releases). To update, re-run the `curl` from the install step. Version numbers are `0.x` deliberately: the output format and state files are still free to change, and a `0.x` makes no compatibility promise.
+Releases are [tagged](https://github.com/hawkesj12/revline/releases). To update, re-run the `curl` from the install step. CI refuses any tag whose version disagrees with what `revline version` reports, so a release can't claim to be something it isn't. Version numbers are `0.x` deliberately: the output format and state files are still free to change, and a `0.x` makes no compatibility promise.
 
 ## Contributing
 
