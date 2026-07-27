@@ -154,3 +154,4 @@ broken staged file can't slip past a clean working tree.
 ## License
 
 [MIT](LICENSE) © 2026 Justin Hawkes
+
