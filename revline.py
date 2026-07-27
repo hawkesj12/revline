@@ -70,6 +70,12 @@ import re
 import sys
 import time
 
+# The one thing a bug report needs to be actionable. revline installs by copying a file,
+# so there is no package manager to ask "which revision is this?" — `revline version`
+# is that answer. 0.x on purpose: it makes no compatibility promise, which is honest for
+# a tool whose output format and state files are still free to change.
+__version__ = "0.1.0"
+
 # The status line spawns a FRESH process every render (~1/sec), so every top-level
 # import is paid on EVERY render. `subprocess` (git, ~1 render in 12), `glob` (only
 # throttled/cold paths), and `unicodedata` (horizontal layout only) are therefore
@@ -1289,7 +1295,7 @@ def _cleanup_session(sid):
             pass
 
 
-_USAGE = """revline — a rich status line for Claude Code
+_USAGE = f"""revline {__version__} — a rich status line for Claude Code
 
 Four sections in the footer:
   Claude Code  model · thinking · effort · session · cost · context · cache/burn/api
@@ -1310,6 +1316,7 @@ Layout control (writes revline.config.json as H/V; next render picks it up ~1s):
   revline H               horizontal — two columns (Claude Code + Git | Gauges + Usage)
   revline V               vertical — stacked (the default)
   revline help            show this
+  revline version         print the version (quote it in a bug report)
   (horizontal / vertical also accepted)
 
 Session cleanup (wire to a SessionEnd hook so a closed session leaves nothing behind):
@@ -1379,6 +1386,9 @@ def main():
             except Exception:
                 sid = ""
         _cleanup_session(sid or "")
+        return
+    if verb in ("version", "v-", "ver"):
+        _emit(f"revline {__version__}", honour_declared=True)
         return
     if verb in ("help", "usage") or _stdin_isatty():
         # `revline help`, a bare `revline`, OR a mistyped verb in a terminal — any

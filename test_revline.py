@@ -525,6 +525,41 @@ def test_render_survives_hostile_encoding():
     wipe("revtest-enc")
 
 
+def test_version_is_reachable():
+    print("\n[8d] the version is reachable and matches __version__")
+    # revline installs by copying a file, so `revline version` is the ONLY way a user
+    # can tell you which revision they are running. If this drifts from __version__ or
+    # stops printing, every future bug report gets less actionable and nothing else
+    # would notice.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "rl_ver", os.path.join(HERE, "revline.py")
+    )
+    rl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rl)
+
+    check(
+        "__version__ looks like a version",
+        re.fullmatch(r"\d+\.\d+\.\d+", rl.__version__) is not None,
+    )
+    for verb in ("version", "--version"):
+        r = run_revline([verb])
+        out = r.stdout.decode("ascii", "replace").strip()
+        check(f"`revline {verb}` exits 0", r.returncode == 0)
+        check(f"`revline {verb}` prints {rl.__version__}", rl.__version__ in out)
+    # It must also survive a hostile stdout — this is the command you ask a user to run
+    # when something is already broken, so it cannot be the thing that breaks.
+    r = run_revline(["version"], env_extra={"PYTHONIOENCODING": "ascii"})
+    check(
+        "version survives an ascii stdout",
+        r.returncode == 0 and rl.__version__.encode() in r.stdout,
+    )
+    # And the help banner carries it, since that is where people look first.
+    h = run_revline(["help"]).stdout.decode("utf-8", "replace")
+    check("help banner shows the version", rl.__version__ in h)
+
+
 def test_no_implicit_locale_encoding():
     print("\n[9] no implicit locale-dependent encoding anywhere (PEP 597 detector)")
     # PEP 597's EncodingWarning fires on every open() that omits encoding= and every
@@ -672,6 +707,7 @@ if __name__ == "__main__":
         test_render_on_the_real_windows_path,
         test_ascii_ramp_is_a_faithful_translation,
         test_render_survives_hostile_encoding,
+        test_version_is_reachable,
         test_no_implicit_locale_encoding,
         test_crossplatform_state_paths,
     ):

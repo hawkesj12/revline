@@ -101,6 +101,7 @@ revline flip     # toggle H <-> V
 revline H        # horizontal
 revline V        # vertical
 revline help     # usage
+revline version  # which revision you're running
 ```
 
 ## Configuration
@@ -129,6 +130,12 @@ revline handles it by asking who is reading:
 - **The terminal commands** (`revline help`, `revline flip`, …) print wherever _you_ pointed them, so there a `PYTHONIOENCODING` you set is honoured. If it can't carry the block characters, the chart degrades to an ASCII ramp that still charts — `[_.:-=+*#|#*+=-:._]` — rather than to question marks.
 
 Input is pinned to UTF-8 too, so a project path, branch, or model name with non-ASCII characters arrives intact instead of mangling the Git section.
+
+## Versions
+
+revline installs by copying a file, so there's no package manager to ask what you're running. `revline version` (or the first line of `revline help`) tells you — quote it if you open an issue.
+
+Releases are [tagged](https://github.com/hawkesj12/revline/releases). To update, re-run the `curl` from the install step. Version numbers are `0.x` deliberately: the output format and state files are still free to change, and a `0.x` makes no compatibility promise.
 
 ## Contributing
 
