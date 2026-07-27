@@ -1,0 +1,105 @@
+name: CI
+
+# The EDGE-triggered layer. audit.yml is level-triggered — it catches things that rot
+# on their own (a dead link, a repointed tag, a new CVE) with no commit to trigger on.
+# This one is the opposite: it checks a CHANGE, at the moment it is made.
+#
+# Why it exists, specifically: revline runs on macOS AND Windows, and Windows is the
+# one that cannot be checked on the machine it is developed on. Everything else here
+# (tests, lint) is worth having but is not the reason — the Windows job is.
+#
+# Note this is downstream of the failure that actually bites. ~/.claude/revline.py is a
+# symlink into the working tree, so a bad save is live in every open session before any
+# of this runs. The pre-commit hook (hooks/pre-commit) is the layer for that; CI is what
+# makes the repo trustworthy to someone who is not you.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-flight run pointless — cancel it rather
+# than pay for both. Never cancels on main, so the default branch keeps a full history.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # a Windows-only failure must not hide the Linux result
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 3.10 is the floor the SUITE needs, not the floor revline needs: PEP 597's
+        # EncodingWarning (which test [9] uses to prove there is no implicit locale
+        # encoding anywhere) landed in 3.10. revline.py itself uses no version-gated
+        # syntax at all — no match/case, no PEP 604 unions, no builtin generics.
+        # Add "3.15" when runners offer it: PEP 686 turns UTF-8 mode on by default
+        # there, so it is the version that proves the encoding fix is future-safe too.
+        python: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false # nothing here pushes; don't leave a token behind
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Tests
+        shell: bash # one shell on both OSes, so the step means the same thing
+        env:
+          # Force LOCALE encoding mode rather than hoping the runner happens to be
+          # configured badly enough to expose the bug. On Windows this is cp1252 — the
+          # exact condition that used to blank the footer. Without this the Windows job
+          # would quietly pass on a UTF-8 runner and prove nothing, and would go on
+          # proving nothing forever once 3.15 makes UTF-8 mode the default.
+          PYTHONUTF8: "0"
+        run: python test_revline.py
+
+      - name: Render smoke — the thing Claude Code actually does
+        shell: bash
+        env:
+          PYTHONUTF8: "0"
+        run: |
+          # Empty JSON is the degenerate payload: it must render, not traceback, and
+          # must exit 0. This is the never-throw invariant checked end-to-end through a
+          # real pipe, which is how Claude Code reads it.
+          # No explicit assertion needed: the step shell runs with -eo pipefail, so a
+          # traceback or nonzero exit fails the job on its own. The output is here to
+          # be eyeballed in the log, not to gate anything.
+          echo '{}' | python revline.py
+
+  lint:
+    # OS-independent, so it runs once rather than four times.
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      # ruff is a CI-only tool. It never ships with revline and never gets imported by
+      # it — the zero-runtime-dependency property is untouched.
+      # Pinned, not floating: ruff's formatter changes between releases, so an
+      # unpinned install turns an upstream release into a surprise red build on an
+      # unrelated commit. This is the version the repo is actually formatted with —
+      # bump it deliberately, and reformat in the same commit.
+      - name: Install ruff
+        run: pip install ruff==0.15.7
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .

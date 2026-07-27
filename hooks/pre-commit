@@ -1,0 +1,72 @@
+#!/bin/sh
+# revline pre-commit gate
+#
+# Enable with:   git config core.hooksPath hooks
+# Disable with:  git config --unset core.hooksPath
+# Bypass once:   git commit --no-verify
+#
+# Why this exists separately from CI: ~/.claude/revline.py is a SYMLINK into this
+# working tree, so a bad save is live in every open Claude Code session immediately —
+# before any push, and therefore before CI can possibly see it. It fails quietly (the
+# footer just goes blank), so you may not notice which edit did it.
+#
+# This is still not a save-time check — nothing but an editor watcher can be — but it
+# is the last point where a broken revline is still only yours.
+#
+# Deliberately fast (~2s). A gate people disable for being slow gates nothing.
+set -e
+
+repo=$(git rev-parse --show-toplevel)
+cd "$repo"
+
+# Windows ships `python.exe` and no `python3` (CPython's installer creates versioned
+# names, not a python3 alias), so a hard-coded python3 would block every commit for a
+# Windows contributor following the README. Resolve it once, prefer python3 on Unix.
+if command -v python3 >/dev/null 2>&1; then PY=python3
+elif command -v python  >/dev/null 2>&1; then PY=python
+else
+  echo "revline pre-commit: no python3 or python on PATH — skipping checks."
+  exit 0   # a missing interpreter is not a reason to block a commit
+fi
+
+printf 'revline pre-commit: '
+
+# 1. Does it still render? The cheapest possible check and the one that maps directly
+#    to "is my footer about to go blank". Empty JSON is the degenerate payload.
+printf 'render '
+if ! echo '{}' | "$PY" revline.py >/dev/null 2>&1; then
+  echo ""
+  echo "  ✗ revline.py failed to render — your status line is broken RIGHT NOW."
+  echo "    Reproduce with:  echo '{}' | $PY revline.py"
+  exit 1
+fi
+
+# 2. The suite. Includes the encoding tests, which are the ones that catch a Windows
+#    regression you structurally cannot see on this machine.
+printf 'tests '
+if ! "$PY" test_revline.py >/tmp/revline-precommit.$$ 2>&1; then
+  echo ""
+  echo "  ✗ tests failed:"
+  tail -20 /tmp/revline-precommit.$$
+  rm -f /tmp/revline-precommit.$$
+  exit 1
+fi
+rm -f /tmp/revline-precommit.$$
+
+# 3. Lint + format, but only if ruff is present — this hook must not become a reason
+#    to install something before you can commit.
+if command -v ruff >/dev/null 2>&1; then
+  printf 'lint '
+  if ! ruff check . >/dev/null 2>&1; then
+    echo ""
+    echo "  ✗ ruff check failed — run: ruff check ."
+    exit 1
+  fi
+  if ! ruff format --check . >/dev/null 2>&1; then
+    echo ""
+    echo "  ✗ formatting — run: ruff format ."
+    exit 1
+  fi
+fi
+
+echo "ok"

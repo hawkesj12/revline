@@ -36,6 +36,18 @@
 #     tokens/sec rate against a per-second reference.
 #   • Repo + PR are OSC 8 hyperlinks — Cmd-click to open on GitHub.
 #   • Git is cached per session (12s TTL) so a big dirty repo never lags renders.
+#   • TEXT ENCODING is decided by WHO IS READING (see _emit / _ASCII_FALLBACK). Every
+#     glyph above is outside Latin-1, and before Python 3.15 (PEP 686) Windows takes a
+#     PIPE's encoding from the locale — cp1252 — which can encode none of them. The
+#     footer has exactly ONE reader (Claude Code, over a pipe, which takes UTF-8), so
+#     the render path pins stdout to UTF-8 and always ships the real chart. The control
+#     verbs print wherever the USER redirected them, so THERE a declared
+#     PYTHONIOENCODING wins and the chart degrades to an ASCII ramp that still charts.
+#     stdin is pinned to UTF-8 too (errors="replace"), so a non-ASCII cwd or branch
+#     can't mangle the Git section. Getting this wrong is invisible: an encode failure
+#     inside _render is caught by main()'s never-throw guard, which prints "", so the
+#     footer goes BLANK at exit 0 — the safety net HIDES the failure. That is why the
+#     tests assert information survival, not absence-of-traceback.
 #
 # ── What the mirror MEASURES (read this before trusting the numbers) ──
 #   READING is NON-CACHE input: the tokens the model genuinely reads fresh each turn —
@@ -172,6 +184,91 @@ def link(url, text):
 
 SPARK = "▁▂▃▄▅▆▇█"  # 8 heights — indexed directly by the mirror cells / tach
 
+# ── output encoding: degrade the GLYPHS, never the information ──
+# Every glyph above is outside Latin-1. Until Python 3.15 ships PEP 686 (UTF-8 mode on
+# by default), Windows picks the default encoding for a PIPE — which is exactly how
+# Claude Code reads this — from the locale, historically cp1252. Encoding then fails,
+# _render raises, main()'s never-throw guard catches it and prints "", and the footer
+# goes BLANK at exit 0. The guard holds and the feature is silently 100% dead.
+#
+# So the fallback is a ramp that still CHARTS in pure ASCII. A plainer mirror reads
+# fine; an empty footer tells you nothing. Ordered by visual weight so the bars still
+# show relative magnitude at a glance.
+_ASCII_FALLBACK = str.maketrans(
+    {
+        "▁": "_",
+        "▂": ".",
+        "▃": ":",
+        "▄": "-",
+        "▅": "=",
+        "▆": "+",
+        "▇": "*",
+        "█": "#",
+        "░": ".",
+        "│": "|",
+        "▏": "[",
+        "▕": "]",
+        "─": "-",
+        "–": "-",
+        "—": "-",
+        "·": "-",  # the _USAGE section separator — 11 of them; missed on the first pass
+        "↑": "^",
+        "↓": "v",
+        "✓": "+",
+        "●": "o",
+        "✎": "~",
+        "◌": ".",
+        "→": "->",
+        "←": "<-",
+        "≤": "<=",
+        # The Braille-blank indent has no ASCII twin that survives Claude Code's
+        # per-line trim. A plain space may get trimmed, costing the indent — still
+        # strictly better than losing the line.
+        "⠀": " ",
+    }
+)
+
+
+def _emit(text, honour_declared=False):
+    """Print `text`, degrading glyphs to ASCII when stdout cannot carry them.
+
+    `honour_declared` splits the two callers by WHO is reading, which is the whole
+    design. The FOOTER has exactly one consumer — Claude Code, reading a pipe — and it
+    takes UTF-8, so the render path upgrades unconditionally: a Windows pipe defaulting
+    to cp1252 is an accident, and an unrelated global PYTHONIOENCODING left over from
+    some other script is not Claude Code declaring anything. The CONTROL VERBS
+    (help/flip/layout) print wherever the USER pointed them — a terminal, a redirect, a
+    pipe into something else — so there a declared encoding IS authoritative and gets
+    honoured, dropping to the ASCII ramp rather than overriding them.
+
+    That split is also what keeps _ASCII_FALLBACK a live, reachable, testable path:
+    reconfigure succeeds on every Python 3.7+, so with an unconditional upgrade
+    everywhere the ramp would be dead code."""
+    out = sys.stdout
+    enc = (getattr(out, "encoding", None) or "utf-8").lower()
+    declared = honour_declared and os.environ.get("PYTHONIOENCODING")
+    if enc.replace("-", "") != "utf8" and not declared:
+        try:
+            out.reconfigure(encoding="utf-8")
+            enc = "utf-8"
+        except Exception:
+            pass
+    # The probe is a SECOND encode of the same text and that is deliberate — measured at
+    # 0.83us against a ~21ms render (0.004%), and it is load-bearing: if stdout carries a
+    # lenient handler (PYTHONIOENCODING=ascii:replace) print() never raises and you get
+    # "?" soup. text.encode() is always STRICT, so the probe catches that and hands back
+    # the readable ramp instead. Do not "optimise" it away, and do not probe only the
+    # glyph set — that would miss a non-ASCII branch or directory name.
+    try:
+        text.encode(enc)
+    except (UnicodeEncodeError, LookupError):
+        text = text.translate(_ASCII_FALLBACK)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Belt and braces: a glyph added later with no entry in the table above.
+        print(text.encode("ascii", "replace").decode("ascii"))
+
 
 def _atomic_write(path, text):
     """Write via a temp file + os.replace, so a concurrent reader always sees a
@@ -179,7 +276,7 @@ def _atomic_write(path, text):
     on both the 1s timer AND after a message, so same-session writes can overlap."""
     tmp = f"{path}.tmp.{os.getpid()}"
     try:
-        with open(tmp, "w") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
     except Exception:
@@ -197,7 +294,9 @@ def _read_store(path):
     rows = []
     try:
         if os.path.exists(path):
-            for ln in open(path).read().splitlines():
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            for ln in lines:
                 try:
                     rows.append(tuple(int(x) for x in ln.split(",")))
                 except Exception:
@@ -292,10 +391,11 @@ def _log_rate(t, read, write):
         return
     try:
         path = os.path.join(_here(), _RATE_LOG)
-        with open(path, "a") as fh:
+        with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"{t},{int(read)},{int(write)}\n")
         if os.path.getsize(path) > _RATE_LOG_TRIM_AT:
-            kept = open(path).read().splitlines()[-_RATE_LOG_KEEP:]
+            with open(path, encoding="utf-8") as fh:
+                kept = fh.read().splitlines()[-_RATE_LOG_KEEP:]
             _atomic_write(path, "\n".join(kept) + "\n")
     except Exception:
         pass
@@ -329,7 +429,8 @@ def _full_scales():
     now = time.time()
     try:
         if os.path.exists(cache) and now - os.path.getmtime(cache) < _SCALE_TTL:
-            d = json.loads(open(cache).read())
+            with open(cache, encoding="utf-8") as fh:
+                d = json.loads(fh.read())
             return {int(k): tuple(v) for k, v in d.items()}
     except Exception:
         pass
@@ -344,7 +445,9 @@ def _full_scales():
     try:
         events = []
         for path in glob.glob(os.path.join(here, "token_rates*.log")):
-            for ln in open(path).read().splitlines():
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            for ln in lines:
                 p = ln.split(",")
                 if len(p) == 3:
                     try:  # skip ONE torn/garbled line, don't abandon all calibration
@@ -650,7 +753,8 @@ def git_state(cwd, sid):
     cache = os.path.join(TMP, f"cc-statusline-{sid}")
     if os.path.exists(cache) and (time.time() - os.path.getmtime(cache) < 12):
         try:
-            vals = open(cache).read().split("\t")
+            with open(cache, encoding="utf-8") as fh:
+                vals = fh.read().split("\t")
             if len(vals) == len(keys):
                 g = dict(zip(keys, vals))
                 for k in (
@@ -682,8 +786,18 @@ def git_state(cwd, sid):
         if stalled:
             return ""
         try:
+            # git emits raw bytes for refs and paths, so text=True alone would decode
+            # them with the LOCALE encoding (cp1252 on Windows before Python 3.15's
+            # PEP 686). A branch or directory with a non-ASCII character would then
+            # mangle or raise. Pin utf-8 — what git actually uses — and replace any
+            # stray byte rather than let one odd character take out the whole footer.
             r = subprocess.run(
-                ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=2
+                ["git", "-C", cwd, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
             )
             return r.stdout.strip() if r.returncode == 0 else ""
         except subprocess.TimeoutExpired:
@@ -756,7 +870,7 @@ def _config():
     """Optional per-user settings from revline.config.json beside this script.
     Missing or malformed → {} (config is always optional; never crash on it)."""
     try:
-        with open(_config_path()) as fh:
+        with open(_config_path(), encoding="utf-8") as fh:
             c = json.load(fh)
         return c if isinstance(c, dict) else {}
     except Exception:
@@ -1149,7 +1263,7 @@ def _render(d):
     else:
         lines = sec_cc + sec_git + sec_gauge + sec_use
 
-    print("\n".join(lines))
+    _emit("\n".join(lines))
 
 
 def _cleanup_session(sid):
@@ -1182,6 +1296,10 @@ Four sections in the footer:
   Git          repo (clickable) · branch · ahead/behind · PR · dirty · last-commit age
   Gauges       the read/write "mirror" — tokens READ (non-cache input, warm, left) vs
                WRITTEN (output, cool, right): a live tps needle + 1m / 10m / 4h / 1d
+
+                 10m:   42k ▏▁▂▃▄▅▆▇█│█▇▆▅▄▃▂▁▕ 3k
+                             read →  now  ← written
+
   Usage        5h / 7d rate-limit budgets as bars
 
 Rendering (Claude Code runs this for you; it reads the session JSON on stdin):
@@ -1201,17 +1319,48 @@ Session cleanup (wire to a SessionEnd hook so a closed session leaves nothing be
 Orientation is also read from the CC_STATUSLINE_LAYOUT env var as a fallback."""
 
 
+def _stdin_isatty():
+    """isatty() guarded: sys.stdin is None when stdin is closed, and both call sites
+    live OUTSIDE main()'s never-throw guard (which only wraps _render), so an
+    unguarded call tracebacks — a SessionEnd hook firing with stdin closed does
+    exactly that. Default True: no readable stdin means treat it like a terminal and
+    show usage, never block on a read that can't complete."""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return True
+
+
 def main():
+    # Pin stdin to UTF-8 before ANY read. Claude Code writes UTF-8 JSON, but stdin's
+    # decoding is locale-derived on Windows just like stdout's was, so a non-ASCII
+    # cwd, branch, or model name arrives mangled — and a mangled current_dir makes
+    # `git -C <path>` fail, silently emptying the whole Git section.
+    #
+    # errors="replace", NOT the platform default: Windows defaults to surrogateescape,
+    # which yields lone surrogates that are unencodable in EVERY codec — so one odd
+    # input byte would blow past the ASCII ramp and hit the final replace-net,
+    # flattening the ENTIRE footer. U+FFFD from "replace" encodes cleanly in UTF-8, so
+    # the damage stays confined to the one mangled field.
+    #
+    # Wrapped, and placed before any read: sys.stdin is None when stdin is closed
+    # (reconfigure would raise AttributeError), and a TextIOWrapper refuses to
+    # reconfigure once read from. Failing here is exactly today's behaviour.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     # Control verbs run WITHOUT touching stdin (so `revline flip` never blocks).
     verb = sys.argv[1].strip().lower().lstrip("-") if len(sys.argv) > 1 else ""
     if verb == "flip":
-        print(_flip())
+        _emit(_flip(), honour_declared=True)
         return
     if verb in ("horizontal", "wide", "h"):
-        print(_set_layout("horizontal"))
+        _emit(_set_layout("horizontal"), honour_declared=True)
         return
     if verb in ("vertical", "v"):
-        print(_set_layout("vertical"))
+        _emit(_set_layout("vertical"), honour_declared=True)
         return
     if verb == "cleanup":
         # `revline cleanup <sid>` (explicit sid) OR a SessionEnd hook (sid + reason
@@ -1219,7 +1368,7 @@ def main():
         # fall through to stdin then (even if it's empty), or `cleanup ""` would block
         # forever on json.load. Only read stdin when NO argv sid was given.
         sid = sys.argv[2] if len(sys.argv) > 2 else None
-        if sid is None and not sys.stdin.isatty():
+        if sid is None and not _stdin_isatty():
             try:
                 j = obj(json.load(sys.stdin))
                 # SessionEnd also fires on /clear and resume, but those KEEP the session
@@ -1231,12 +1380,12 @@ def main():
                 sid = ""
         _cleanup_session(sid or "")
         return
-    if verb in ("help", "usage") or sys.stdin.isatty():
+    if verb in ("help", "usage") or _stdin_isatty():
         # `revline help`, a bare `revline`, OR a mistyped verb in a terminal — any
         # tty invocation that isn't a known control verb. There's no piped JSON, so
         # show help instead of falling through to json.load(stdin), which would block
         # the terminal forever waiting on input that never comes.
-        print(_USAGE)
+        _emit(_USAGE, honour_declared=True)
         return
 
     # ── render path ──
