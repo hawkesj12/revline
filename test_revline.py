@@ -322,10 +322,13 @@ def test_cleanup_cannot_over_delete():
 
 # ── cross-platform / encoding ────────────────────────────────
 # These exist because the working tree is production on TWO operating systems, and
-# Windows is the one that can't be checked here. Until Python 3.15 ships PEP 686
-# (UTF-8 mode on by default), Windows resolves the default encoding for BOTH files
-# and pipes from the locale — historically cp1252. Claude Code reads the status line
-# through a PIPE, which is exactly the case PEP 686 calls out as still locale-bound.
+# Windows is the one that can't be checked here. The authoritative statement is in the
+# CPython `sys` docs, not PEP 686: "On Windows, UTF-8 is used for the console device.
+# Non-character devices such as disk files and pipes use the system locale encoding"
+# — historically cp1252. That console/pipe split is the whole bug: an interactive
+# Windows console is fine (PEP 528 routes it through WriteConsoleW), but Claude Code
+# reads the status line through a PIPE, which is not a console. PEP 686 is the FIX
+# date, not the evidence — it makes UTF-8 mode the default in Python 3.15.
 #
 # Why "it didn't crash" is not enough here: an encoding failure inside _render is
 # caught by main()'s never-throw guard, which prints "" — so the footer goes BLANK,
