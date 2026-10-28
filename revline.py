@@ -9,6 +9,7 @@
 #   Gauges:       the read/write "mirror" — a butterfly of tokens READ (input) vs
 #                 WRITTEN (output): a live tps needle + a timeline at 1m/10m/4h/1d
 #   Usage:        5h / 7d rate-limit budgets as bars (the Max-plan runway)
+#                 + which account those budgets bill
 #
 # The mirror, per row:  <label>  <read#> ▏<chart>▕ <write#>
 #   • Reading (input, incl. cache) is WARM and fills the left half from the center
@@ -74,7 +75,7 @@ import time
 # so there is no package manager to ask "which revision is this?" — `revline version`
 # is that answer. 0.x on purpose: it makes no compatibility promise, which is honest for
 # a tool whose output format and state files are still free to change.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # The status line spawns a FRESH process every render (~1/sec), so every top-level
 # import is paid on EVERY render. `subprocess` (git, ~1 render in 12), `glob` (only
@@ -348,6 +349,128 @@ def _gc():
                 pass
     except Exception:
         pass
+
+
+# ── Account ───────────────────────────────────────────────────
+# WHICH Claude account this session is spending. Anyone holding more than one
+# login — a personal subscription plus a work Team seat is the common pair —
+# can otherwise burn the wrong pool for an entire session without noticing,
+# because nothing else on screen distinguishes them.
+#
+# The status-line payload carries NO account field (checked against the
+# documented schema: cwd, session_id, model, workspace, cost, context_window,
+# rate_limits, pr, worktree — no email, org, or plan). So it has to be read
+# locally, and cheaply, because this renders about once a second.
+#
+# WHICH profile is live is settled by one env read: Claude Code keys a profile
+# to CLAUDE_CONFIG_DIR. On macOS each profile gets its OWN Keychain item — the
+# default profile uses service "Claude Code-credentials" and a CLAUDE_CONFIG_DIR
+# profile gets that name with a per-directory suffix ("...-65ef2611") — so two
+# accounts coexist with no shared credential store and no clobbering. Verified
+# by logging a second account in and watching the first item's mtime not move.
+# The identity itself sits in <profile>/.claude.json as oauthAccount.
+#
+# The cache key is the source file's (mtime, size), NOT a clock TTL — and that
+# matters more than the ~0.6 ms it saves. A TTL caches a FAILED parse too, so a
+# render landing mid-rewrite would blank the account for the length of the TTL,
+# and a re-login would keep showing the old account until it expired. Keying on
+# the file means the next render after any write is already correct. This value
+# exists to prevent a wrong-account session; it must never be confidently stale.
+#
+# Subscription is not the only way Claude Code bills. When a third-party
+# provider or an API key is in play the spend leaves the subscription entirely,
+# and a leftover oauthAccount record would make a WRONG answer look
+# authoritative — worse than no answer. Those are checked first, from the
+# environment, before the file is ever opened.
+_PROVIDERS = (
+    ("CLAUDE_CODE_USE_BEDROCK", "bedrock", "aws"),
+    ("CLAUDE_CODE_USE_VERTEX", "vertex", "gcp"),
+    ("CLAUDE_CODE_USE_FOUNDRY", "foundry", "azure"),
+)
+_LABEL_MAX = 14  # every other field is bounded; this one is user-controlled
+
+
+def _account():
+    """(label, plan) for whatever is billing this session, or None if unknown.
+
+    Precedence mirrors Claude Code's own: a third-party provider or an API key
+    outranks the stored subscription login, so those report as themselves
+    rather than as the subscription they are not spending.
+
+    For a subscription, plan is oauthAccount.organizationType with the "claude_"
+    prefix stripped — the same mapping Claude Code displays (claude_max → max,
+    claude_pro → pro, claude_team → team, claude_enterprise → enterprise).
+
+    label defaults to the PLAN ALONE — no email. revline output gets screenshot
+    into READMEs, and the plan already disambiguates the common case (a personal
+    Max beside a work Team seat) with no personal data in it. Two opt-in ways to
+    get a real name, both via revline.config.json:
+        {"accounts": {"you@example.com": "personal"}}   an explicit alias
+        {"account_email": true}                          the email's local part
+    """
+    try:
+        for var, provider, plan in _PROVIDERS:
+            if os.environ.get(var, "").strip().lower() in ("1", "true", "yes"):
+                return (provider, plan)
+        if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
+            "ANTHROPIC_AUTH_TOKEN"
+        ):
+            return ("api key", "metered")
+
+        # The default profile keeps .claude.json in $HOME; a CLAUDE_CONFIG_DIR
+        # profile keeps its own inside that directory. The "p-" prefix stops a
+        # profile key from ever colliding with the "default" sentinel — a
+        # relative CLAUDE_CONFIG_DIR=default would otherwise sanitize to it.
+        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if cfg_dir:
+            src = os.path.join(cfg_dir, ".claude.json")
+            key = "p-" + re.sub(r"[^A-Za-z0-9._-]", "_", cfg_dir)[-60:]
+        else:
+            src = os.path.join(os.path.expanduser("~"), ".claude.json")
+            key = "default"
+        # The "acct." infix is load-bearing: _cleanup_session skips it, so one
+        # session ending cannot delete this machine-level cache.
+        cache = os.path.join(TMP, "cc-statusline-acct." + key)
+
+        try:
+            st = os.stat(src)
+            stamp = "%d:%d" % (int(st.st_mtime), st.st_size)
+        except Exception:
+            return None  # no profile file → nothing truthful to say
+
+        try:
+            with open(cache, encoding="utf-8") as fh:
+                hit = fh.read().split("\t")
+            if hit[0] == stamp:
+                # a cached miss stores the stamp alone — honour it, don't reparse
+                return (hit[1], hit[2]) if len(hit) == 3 and hit[1] else None
+        except Exception:
+            pass
+
+        label = plan = ""
+        try:
+            with open(src, encoding="utf-8") as fh:
+                acct = json.load(fh).get("oauthAccount") or {}
+            email = acct.get("emailAddress")
+            email = email if isinstance(email, str) else ""
+            otype = acct.get("organizationType")
+            plan = (otype if isinstance(otype, str) else "").replace("claude_", "")
+            cfg = _config()
+            aliases = cfg.get("accounts")
+            alias = aliases.get(email) if isinstance(aliases, dict) and email else None
+            if alias:
+                label = str(alias)[:_LABEL_MAX]
+            elif cfg.get("account_email") and email:
+                label = email.split("@")[0][:_LABEL_MAX]
+            elif plan:
+                label, plan = plan[:_LABEL_MAX], ""  # plan alone — the private default
+        except Exception:
+            pass
+
+        _atomic_write(cache, (stamp + "\t" + label + "\t" + plan) if label else stamp)
+        return (label, plan) if label else None
+    except Exception:
+        return None
 
 
 # Per-MACHINE, per-TIMESCALE scale calibration. The gauge full-scale isn't hardcoded
@@ -1261,6 +1384,17 @@ def _render(d):
         if week is not None:
             sec_use.append(f"{IND}{usage_bar('7d', week, week_reset)}")
 
+        # Whose budget those bars draw down. It sits under 7d because it
+        # qualifies both bars above it — a rate-limit % is per-account, so the
+        # bars are ambiguous without it.
+        acct = _account()
+        if acct:
+            who, plan = acct
+            sec_use.append(
+                f"{IND}{lbl('account')}{GREEN}{who}{R}"
+                + (f" {DIM}({plan}){R}" if plan else "")
+            )
+
     # ── assemble by orientation ──
     # horizontal: Claude Code + Git on the left, Gauges + Usage on the right.
     # vertical (default): all four stacked, byte-identical to the original.
@@ -1284,7 +1418,13 @@ def _cleanup_session(sid):
     import glob  # SessionEnd-only path — not imported on a normal render
 
     esc = glob.escape(sid)
-    targets = glob.glob(os.path.join(TMP, f"cc-statusline-*{esc}*"))
+    # The account cache is machine-level, not per-session: a profile PATH holding
+    # a session-id substring would otherwise let one session's exit delete it.
+    targets = [
+        f
+        for f in glob.glob(os.path.join(TMP, f"cc-statusline-*{esc}*"))
+        if not os.path.basename(f).startswith("cc-statusline-acct.")
+    ]
     targets += glob.glob(
         os.path.join(_here(), f"token_rates-{esc}.*")
     )  # legacy, if any
@@ -1306,7 +1446,7 @@ Four sections in the footer:
                  10m:   42k ▏▁▂▃▄▅▆▇█│█▇▆▅▄▃▂▁▕ 3k
                              read →  now  ← written
 
-  Usage        5h / 7d rate-limit budgets as bars
+  Usage        5h / 7d rate-limit budgets as bars, and the account they bill
 
 Rendering (Claude Code runs this for you; it reads the session JSON on stdin):
   revline                 render the status line

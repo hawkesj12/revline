@@ -263,6 +263,131 @@ def test_window_nesting():
     )
 
 
+def test_account_never_lies():
+    """[14] the account line is right in every billing mode, or absent — never
+    confidently wrong. A leftover oauthAccount record must NOT be reported as the
+    payer when an API key or a third-party provider is actually billing, and a
+    malformed/renamed/missing profile must degrade to no line at all."""
+    print("\n[14] account line: correct, or absent — never confidently wrong")
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "rl_acct", os.path.join(HERE, "revline.py")
+    )
+    rl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rl)
+
+    home = tempfile.mkdtemp(prefix="revline-acct-")
+    atexit.register(lambda: shutil.rmtree(home, ignore_errors=True))
+
+    def profile(payload):
+        """A config dir holding a .claude.json with the given content."""
+        d = tempfile.mkdtemp(prefix="revline-prof-", dir=home)
+        with open(os.path.join(d, ".claude.json"), "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        return d
+
+    def acct(cfg_dir=None, **env):
+        """_account() under a controlled environment, cache always cold."""
+        for f in glob.glob(os.path.join(rl.TMP, "cc-statusline-acct.*")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        old = dict(os.environ)
+        for k in (
+            "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ):
+            os.environ.pop(k, None)
+        if cfg_dir:
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg_dir
+        os.environ.update(env)
+        try:
+            return rl._account()
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+
+    good = (
+        '{"oauthAccount":{"emailAddress":"a@b.com","organizationType":"claude_team"}}'
+    )
+    ok = profile(good)
+
+    # the plan enum, stripped exactly the way Claude Code displays it
+    for otype, want in (
+        ("claude_max", "max"),
+        ("claude_pro", "pro"),
+        ("claude_team", "team"),
+        ("claude_enterprise", "enterprise"),
+    ):
+        d = profile(
+            '{"oauthAccount":{"emailAddress":"a@b.com",'
+            '"organizationType":"%s"}}' % otype
+        )
+        check(f"{otype} renders as {want}", acct(d) == (want, ""))
+
+    # a third-party provider or an API key is the payer — NOT the stored login
+    check(
+        "API key outranks a stored login",
+        acct(ok, ANTHROPIC_API_KEY="sk-x")[0] == "api key",
+    )
+    check(
+        "auth token outranks a stored login",
+        acct(ok, ANTHROPIC_AUTH_TOKEN="tok")[0] == "api key",
+    )
+    check(
+        "Bedrock reports itself",
+        acct(ok, CLAUDE_CODE_USE_BEDROCK="1") == ("bedrock", "aws"),
+    )
+    check(
+        "Vertex reports itself",
+        acct(ok, CLAUDE_CODE_USE_VERTEX="true") == ("vertex", "gcp"),
+    )
+    check(
+        "an unset provider flag is not a provider",
+        acct(ok, CLAUDE_CODE_USE_BEDROCK="")[0] == "team",
+    )
+
+    # every malformed profile degrades to no line, never a traceback
+    for label, payload in (
+        ("renamed key", '{"authAccount":{"emailAddress":"a@b.com"}}'),
+        ("truncated json", '{"oauthAccount":{"emailAddress":"a@b'),
+        ("null account", '{"oauthAccount":null}'),
+        ("wrong-typed email", '{"oauthAccount":{"emailAddress":123}}'),
+        ("empty object", "{}"),
+    ):
+        check(f"{label} → no account line", acct(profile(payload)) is None)
+    check(
+        "missing profile file → no account line",
+        acct(tempfile.mkdtemp(prefix="revline-empty-", dir=home)) is None,
+    )
+
+    # the default is plan-only: no email reaches a screenshot without opt-in
+    check("email is NOT shown by default", acct(ok) == ("team", ""))
+
+    # a user-controlled label cannot widen the fixed-width layout
+    long_name = profile(
+        '{"oauthAccount":{"emailAddress":"'
+        + "x" * 120
+        + '@b.com","organizationType":"claude_max"}}'
+    )
+    os.environ["CLAUDE_CONFIG_DIR"] = long_name
+    try:
+        rl._config = lambda: {"account_email": True}
+        lab = acct(long_name)[0]
+    finally:
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    check(
+        f"label clamped to {rl._LABEL_MAX} chars (got {len(lab)})",
+        len(lab) <= rl._LABEL_MAX,
+    )
+
+
 def test_never_crashes():
     print("\n[6] never crashes the footer on bad input")
     for label, payload in (
@@ -710,6 +835,7 @@ if __name__ == "__main__":
         test_version_is_reachable,
         test_no_implicit_locale_encoding,
         test_crossplatform_state_paths,
+        test_account_never_lies,
     ):
         try:
             _t()

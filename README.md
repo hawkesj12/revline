@@ -12,7 +12,7 @@ Claude Code's built-in footer is a single line. When you're deep in a long sessi
 
 ## Features
 
-- **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets).
+- **Four sections, color-grouped by system** — Claude Code (model · thinking · effort · session · cost · context · cache/burn/api), Git (repo · branch · ahead/behind · PR · dirty count · last-commit age), Gauges (the read/write mirror), Usage (rate-limit budgets, and which account they bill).
 - **The read/write "mirror"** — a butterfly chart of tokens **read** (non-cache input, warm) vs **written** (output, cool) over time. Reading fills the left half from the center outward; writing fills the right. Newest is at the center, oldest at the outer edges, with the read and write totals flanking each row.
 - **Five timescales** — `tps` is a live, EMA-smoothed tokens-per-second needle (how fast right now); `1m / 10m / 4h / 1d` are the timeline. Both bar height and hue rise with throughput.
 - **Self-calibrating, per-timescale scale** — instead of a hardcoded peak, each row sets its own "full bar" from _your machine's_ real history: a robust high percentile of how many tokens a bucket of that row's width actually holds when it's active. A 5-second slice and a 2-hour slice hold wildly different amounts, so each timescale is scaled independently — a typical bucket lands mid-bar and only your busiest ones peg. The references are pooled across all your sessions into one small, self-pruning, gitignored `token_rates.log` (more history → a steadier scale) and **frozen** between refreshes, so a given amount always maps to the same height — no render-to-render strobing — and buckets are grid-anchored so a row steps one whole slice at a time as time passes.
@@ -111,6 +111,21 @@ Orientation is resolved in this order:
 1. **`revline.config.json`** next to the script — written by the commands above, e.g. `{"layout": "H"}` (`H` or `V`).
 2. **`CC_STATUSLINE_LAYOUT`** environment variable (`H` / `V` / `horizontal` / `vertical`) — a fallback if you'd rather set it declaratively.
 3. **Default:** vertical.
+
+### The account line
+
+Under the `7d` bar, revline names whatever is actually billing the session — so a second login can't quietly spend the wrong pool. It reads the profile from `CLAUDE_CONFIG_DIR` (unset = your default profile) and the identity from that profile's `.claude.json`, cached against the file's mtime so it costs nothing on a once-a-second render. An API key or a third-party provider (Bedrock, Vertex, Foundry) is reported as *itself* rather than as a stored subscription it isn't spending, and anything unreadable drops the line entirely rather than guessing.
+
+**By default it shows the plan alone** — `account: max` — because status lines end up in screenshots. Two opt-in ways to show a name instead, both in `revline.config.json`:
+
+```json
+{
+  "accounts": { "you@example.com": "personal", "you@work.com": "work" },
+  "account_email": false
+}
+```
+
+`accounts` maps an account's email to whatever label you want. `account_email: true` falls back to the email's local part for accounts you haven't aliased. Labels are clamped to 14 characters so a long one can't widen the layout.
 
 ## What the mirror measures (read this before trusting the numbers)
 
